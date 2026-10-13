@@ -1,5 +1,9 @@
 # 15-thn_project — PILOT Studio 1.0
 
+**팀원 실행용 설치파일:** [PILOT-Studio-Setup-1.0.0.exe 다운로드](https://github.com/gyuwon-k/15-thn_project/releases/download/installer-v1.0.0/PILOT-Studio-Setup-1.0.0.exe) · [배포 설명 및 검증 범위](https://github.com/gyuwon-k/15-thn_project/releases/tag/installer-v1.0.0)
+
+Windows x64에서 설치파일을 다운로드하고 설치한 뒤 `PILOT Studio` 바로가기로 실행합니다. 소스의 `Download ZIP`에는 실행 런타임과 설치파일이 포함되지 않으므로 실행만 하려면 위 설치파일을 받으세요. 이 배포본은 2026-10-12에 검증한 설치본입니다. 이후 진행 중인 HVJB 수정이 모두 반영된 버전은 아닙니다.
+
 이 GitHub 저장소에는 최종 프로그램의 **소스·설계 문서·시험 코드·빌드 설정**을 보관합니다. 개발 환경과 별도 런타임 준비는 [저장소 준비 안내](docs/REPOSITORY_SETUP.md), 구현 기준은 [최종통합 설계서](docs/PILOT_인터페이스_최종통합본_ASAP반영.md)를 참조하세요. 아래 `dist` 경로의 EXE/설치파일은 로컬 배포 산출물이며 Git 소스에는 포함하지 않습니다.
 
 PILOT 인터페이스 최종 통합설계 v1.6과 ASAP 구현설계 v0.4를 기준으로 만든 Windows용 통합 프로그램입니다. 프로젝트·CAD 대응·공정/공구·순서 편집·검증·영상 출력·이력/학습을 하나의 독립 프로그램 창에서 사용합니다.
