@@ -1,0 +1,1 @@
+"""PILOT Studio local application."""

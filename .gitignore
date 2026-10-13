@@ -1,0 +1,57 @@
+# Local Python and frontend environments
+.venv/
+.engine-venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tsbuildinfo
+
+# Generated packages and separately provisioned runtime components
+build/
+dist/
+packaging/resources/
+packaging/downloads/
+packaging/tools/
+*.exe
+*.dll
+*.pyd
+*.zip
+
+# Project/user data, native workspaces, diagnostics, and credentials
+data/
+evidence/
+native-work/
+physics-cache/
+*.log
+*.sqlite*
+*.db
+*.sql
+.env
+.env.*
+!.env.example
+credentials*.json
+secrets*.json
+*.key
+*.pem
+
+# CAD files and model weights must be provisioned separately
+*.stp
+*.step
+*.STP
+*.STEP
+*.CATPart
+*.CATProduct
+*.obj
+*.brep
+*.sdf
+*.pt
+*.pth
+*.pkl
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
