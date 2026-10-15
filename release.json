@@ -1,0 +1,23 @@
+{
+  "format": "pilot-release/2",
+  "app_id": "6F6D0EE9-9DD2-443E-8A9F-E4854A7167BD",
+  "app_version": "2.0.5",
+  "build_id": "pilot-2.0.5-20261014T134453Z",
+  "build_timestamp": "2026-10-14T13:44:53.660888+00:00",
+  "frontend_build_id": "pilot-2.0.5-20261014T134453Z",
+  "backend_build_id": "pilot-2.0.5-20261014T134453Z",
+  "launcher_build_id": "pilot-2.0.5-20261014T134453Z",
+  "api_version": "2",
+  "db_schema_version": 1,
+  "supported_schema_range": [
+    1,
+    1
+  ],
+  "spec_version": "0.6",
+  "preprocess_version": "2.0.1",
+  "matching_version": "2.0.1",
+  "geometry_backend_version": "2.0.1",
+  "recommendation_version": "2.0.2",
+  "render_version": "2.0.5",
+  "feature_schema_version": "1"
+}

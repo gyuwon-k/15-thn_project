@@ -1,57 +1,28 @@
-# Local Python and frontend environments
+# Environments, runtimes and generated output
 .venv/
-.engine-venv/
 venv/
 node_modules/
 __pycache__/
 *.py[cod]
-.pytest_cache/
 *.tsbuildinfo
-
-# Generated packages and separately provisioned runtime components
-build/
-dist/
-packaging/resources/
-packaging/downloads/
-packaging/tools/
-*.exe
-*.dll
-*.pyd
-*.zip
-
-# Project/user data, native workspaces, diagnostics, and credentials
-data/
-evidence/
-native-work/
-physics-cache/
+.pytest_cache/
 *.log
-*.sqlite*
-*.db
-*.sql
+*.tmp
 .env
 .env.*
 !.env.example
-credentials*.json
-secrets*.json
-*.key
-*.pem
-
-# CAD files and model weights must be provisioned separately
-*.stp
+dist/
+build/
+work/
+.test-cache/
+packaging/resources/
+# Company CAD, databases and local backups are registered separately.
 *.step
-*.STP
+*.stp
 *.STEP
-*.CATPart
-*.CATProduct
-*.obj
+*.STP
 *.brep
-*.sdf
-*.pt
-*.pth
-*.pkl
-
-# IDE and OS files
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
+*.sqlite*
+*.db
+*.exe
+*.zip

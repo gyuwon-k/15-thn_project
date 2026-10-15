@@ -1,555 +1,545 @@
-"""Loopback API and launcher. Each expensive job preserves its input revision."""
+"""Local application API with revision-safe jobs, immutable files and snapshots."""
 from __future__ import annotations
-
-import argparse
 import copy
-import csv
-import io
+import hashlib
 import json
-import math
+import mimetypes
 import os
 import re
+import secrets
+import shutil
 import sys
 import threading
-import time
-import traceback
-import webbrowser
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
-
-from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile, Form
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from . import domain
+from .domain import DomainError, digest, now, uid
+from .jobs import JobService, atomic_json, path_values
+from .storage import Storage, StorageConflict
 
-from . import domain, importer, store
-from .domain import DomainError
-from .processing import add_features, geometry_checker
-from .worker import compute
-
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app):
-    store.init()
-    from . import asap_integration
-    asap_integration.startup()
-    try:
-        yield
-    finally:
-        for event in list(CANCEL.values()):event.set()
-        asap_integration.shutdown()
-        import asyncio
-        await asyncio.to_thread(POOL.shutdown,wait=True,cancel_futures=False)
-        store.shutdown()
-
-app = FastAPI(title='PILOT Studio', version='1.0.0', lifespan=lifespan)
-POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='pilot-job')
-CAD_LOCK = threading.Lock()
-CANCEL = {}
-SERVER_PORT = int(os.environ.get('PILOT_PORT', '8770'))
+PROJECT_ROOT=Path(__file__).resolve().parents[1]
+RESOURCE_ROOT=Path(getattr(sys,"_MEIPASS",PROJECT_ROOT))
+SERVER=None
 
 
-@app.middleware('http')
-async def local_only(request: Request, call_next):
-    host = request.headers.get('host', '').split(':')[0]
-    if host not in ('127.0.0.1', 'localhost', '[::1]', 'testserver'):
-        return JSONResponse(status_code=403, content={'detail': '로컬 API는 루프백 주소에서만 사용할 수 있습니다.'})
-    origin = request.headers.get('origin')
-    if origin and not re.fullmatch(r'https?://(localhost|127\.0\.0\.1)(:\d+)?', origin):
-        return JSONResponse(status_code=403, content={'detail': '외부 사이트에서의 API 요청을 허용하지 않습니다.'})
-    response = await call_next(request)
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    return response
+def release_info():
+    from .release import runtime_identity
+    release=runtime_identity()
+    return {**release,"version":release["app_version"],"algorithm_version":release["recommendation_version"]}
 
 
-@app.exception_handler(DomainError)
-async def domain_error(_, exc):
-    return JSONResponse(status_code=409 if exc.code in ('STALE_VALIDATION', 'REVISION_CONFLICT', 'JOB_BUSY', 'CONFIRMED_IMMUTABLE') else 422,
-                        content={'detail': str(exc), 'code': exc.code, 'details': exc.details})
+class Services:
+    def __init__(self, data_dir, resources, release):
+        self.root=Path(data_dir).resolve();self.release=release
+        self.store=Storage(self.root,resources);self.store.init()
+        self.lock=threading.RLock()
+        self.jobs=JobService(self.store,self.root,self.apply_result,release)
+        self.base_url="http://127.0.0.1:"+os.environ.get("PILOT_PORT","8772")
+        self.token=os.environ.get("PILOT_SESSION_TOKEN") or secrets.token_urlsafe(32)
+        self.stop_event=threading.Event()
+        reference=RESOURCE_ROOT/"backend"/"resources"/"company-reference.png"
+        if reference.is_file() and not self.store.get_setting("company_template_seeded",False):
+            asset=self.store.register_file(reference,"video_template")
+            templates=self.store.get_setting("video_templates",[])
+            templates.append({"id":uid("template-"),"name":"제공 HVJB 영상 양식 · 검토 대기","approved":False,"revision":1,
+                              "layout":"company-hvjb-reference","file_id":asset["id"],"background_url":"/api/files/"+asset["id"],
+                              "created_at":now(),"source":"제공 영상 91958-KD000.mp4의 정보 배치","fields":["part_name","part_number","torque","caution"]})
+            self.store.set_setting("video_templates",templates);self.store.set_setting("company_template_seeded",True)
+        self.learning_dispatcher=threading.Thread(target=self.dispatch_learning,name="pilot-learning-scheduler",daemon=True)
+        self.learning_dispatcher.start()
+
+    def dispatch_learning(self):
+        from .learning import build_dataset,reviewed_histories
+        while not self.stop_event.wait(15):
+            try:
+                settings=self.store.get_setting("learning_settings",{})
+                threshold=settings.get("minimum_cases")
+                if not settings.get("automatic_training") or type(threshold) is not int or threshold<1:continue
+                histories=reviewed_histories(self.store.snapshots(),self.store.get_setting("learning_reviews",[]))
+                data=build_dataset(histories);signature=digest(data)
+                models=self.store.get_setting("learning_models",[])
+                previous=max((m.get("eligible_count",0) for m in models if m.get("status") in ("SHADOW_EVALUATION","APPROVED")),default=0)
+                if len(data["eligible_confirmations"])-previous<threshold or self.store.get_setting("last_auto_training_hash")==signature:continue
+                if len({r["group"] for r in data["rows"]})<3:continue
+                if any(j.get("status") in ("queued","running","cancel_requested") for j in self.store.list_jobs()):continue
+                target=next((h["project"]["id"] for h in histories if h["id"] in data["eligible_confirmations"]),None)
+                if not target:continue
+                self.jobs.submit(self.project(target),"train",{"histories":histories,"settings":settings,"output_dir":str(self.root/"models"),"timeout_seconds":600})
+                self.store.set_setting("last_auto_training_hash",signature)
+            except Exception as exc:
+                self.store.set_setting("automatic_training_diagnostic",{"message":str(exc),"at":now()})
+
+    def project(self,ident):
+        result=self.store.get_project(ident)
+        if result is None:raise KeyError(ident)
+        return result
+
+    def aggregate(self,ident):
+        result=self.project(ident)
+        signature=domain.confirmation_hash(result)
+        confirmations=self.store.snapshots(ident)
+        current=next((s for s in confirmations if s.get("source_hash")==signature),None)
+        result["jobs"]=self.store.list_jobs(ident)
+        result["history_count"]=len(confirmations)
+        result["coverage"]=domain.coverage(result)
+        result["can_confirm"]=not domain.confirmation_errors(result,self.release) and not any(j.get("status") in ("queued","running","cancel_requested") for j in result["jobs"])
+        if current:
+            result["confirmed_snapshot_id"]=current["id"]
+            result["plan"]["status"]="CONFIRMED"
+            result["status"]="CONFIRMED";result["can_confirm"]=False
+        return result
+
+    def preserve_model(self,model,project_id):
+        """Publish every referenced shape/scene before linking the new model."""
+        model=path_values(model,self.root)
+        published={}
+        def visit(value):
+            if isinstance(value,dict):return {k:visit(v) for k,v in value.items()}
+            if isinstance(value,list):return [visit(v) for v in value]
+            if isinstance(value,str):
+                try:
+                    path=Path(value)
+                    if path.is_absolute() and path.is_file() and path.resolve().is_relative_to(self.root):
+                        key=str(path.resolve())
+                        if key not in published:
+                            asset=self.store.register_file(path,"model_artifact",project_id)
+                            published[key]=str(self.store.file_path(asset["id"]))
+                        return published[key]
+                except (ValueError,OSError):pass
+            return value
+        return path_values(visit(model),self.root,encode=True)
+
+    def apply_result(self,job,result):
+        with self.lock:
+            project=self.project(job["project_id"]);kind=job["kind"]
+            if kind=="import":
+                if project["revision"]!=job["input_revision"]:
+                    raise DomainError("STALE_RESULT","가져오기 중 프로젝트가 변경되어 결과를 자동 적용하지 않았습니다.")
+                model=self.preserve_model(result,project["id"])
+                project["source_files"]=job.get("source_files",[])
+                model["part_files"]=[a for a in project["source_files"] if a["role"]=="part_step"]
+                project["model"]=model
+                project["input_revision"]=uid("input-")
+                units=model.get("units",[])
+                project["rules"]["fixed_unit_ids"]=[u["id"] for u in units if u.get("fixed")]
+                project["rules"]["precedence"]=[]
+                project["rules"]["contact_policies"]=[]
+                project["rules"]["initial_obstacle_ids"]=[]
+                project["rules"].pop("geometry_review",None)
+                project["plan"]={"id":uid("plan-"),"revision":1,"steps":[],"status":"EMPTY"}
+                project["validation"]=None;project["status"]="MODEL_READY"
+                message=f"STEP 처리 완료 · {len(model.get('occurrences',[]))}개 배치 · {len(units)}개 조립 단위"
+            elif kind in ("generate","validate"):
+                if domain.geometry_hash(project)!=job["geometry_hash"]:
+                    raise DomainError("STALE_RESULT","계산 중 조건이 변경되어 이전 결과를 적용하지 않았습니다.")
+                if kind=="generate":
+                    plan=result["plan"];plan.setdefault("id",uid("plan-"));plan["revision"]=project["plan"].get("revision",0)+1
+                    unit_map={u["id"]:u for u in project["model"].get("units",[])}
+                    for step in plan.get("steps",[]):
+                        step.setdefault("id",uid("step-"));step.setdefault("name",unit_map.get(step.get("unit_id"),{}).get("name","조립"))
+                        step.setdefault("reviewed",False);step.setdefault("caution","");step.setdefault("torque",None)
+                        role=unit_map.get(step.get("unit_id"),{}).get("role","")
+                        step.setdefault("torque_status","required" if role in ("fastener","bolt","nut") else "not_applicable")
+                    project["plan"]=plan
+                validation=result["validation"]
+                # Canonical paths returned by validation replace edited/stale paths.
+                validated_steps=validation.get("steps") or validation.get("validated_steps")
+                if isinstance(validated_steps,list):
+                    checks={s.get("id",s.get("step_id")):s for s in validated_steps}
+                    for step in project["plan"].get("steps",[]):
+                        checked=checks.get(step["id"])
+                        if checked:
+                            for key in ("path","status","diagnostics"):
+                                if key in checked:step[key]=checked[key]
+                validation.update(id=uid("validation-"),dependency_hash=domain.geometry_hash(project),validated_at=now(),
+                                  build_id=self.release["build_id"],algorithm_version=self.release.get("algorithm_version"))
+                if not domain.coverage(project)["complete"] and validation.get("status")=="PASS":
+                    validation.update(status="UNKNOWN",reason="조립 단위 전체 포함 조건을 충족하지 않았습니다.")
+                project["validation"]=validation
+                project["plan"]["status"]="PASS" if validation.get("status")=="PASS" else "DRAFT"
+                project["status"]="VALIDATED" if validation.get("status")=="PASS" else "REVIEW_REQUIRED"
+                message=("조립순서 생성·검증 통과" if kind=="generate" else "조립성 검증 통과") if validation.get("status")=="PASS" else "검토용 순서와 진단 생성 · 확정 전 검토 필요"
+            elif kind=="export":
+                path=Path(path_values(result["video_path"],self.root))
+                asset=self.store.register_file(path,"video",project["id"])
+                result.update(file_id=asset["id"],url="/api/files/"+asset["id"],build_id=self.release["build_id"])
+                result.pop("video_path",None)
+                project.setdefault("exports",[]).append(result);message="MP4 생성·디코딩 검증 완료"
+            elif kind=="train":
+                result=self.preserve_model(result,project["id"])
+                models=self.store.get_setting("learning_models",[]);models.append(result)
+                self.store.set_setting("learning_models",models)
+                self.store.append_event(project["id"],"learning_completed",result)
+                return {"message":result.get("message","학습 평가 완료"),"learning":result}
+            else:raise ValueError(kind)
+            project["revision"]+=1
+            saved=self.store.save_project(project,project["row_version"],{"kind":kind+"_completed","job_id":job["id"],"result_status":project["status"]})
+            return {"project_id":project["id"],"revision":saved["revision"],"message":message,"status":project["status"]}
+
+    def close(self):
+        self.stop_event.set();self.learning_dispatcher.join(timeout=20)
+        self.jobs.close();self.store.close()
 
 
-@app.exception_handler(KeyError)
-async def missing(_, exc):
-    return JSONResponse(status_code=404, content={'detail': f'항목을 찾을 수 없습니다: {exc.args[0]}'})
-
-
-@app.exception_handler(ValueError)
-async def invalid_value(_, exc):
-    conflict=str(exc)=='IDEMPOTENCY_CONFLICT'
-    return JSONResponse(status_code=409 if conflict else 422, content={'detail': str(exc), 'code': 'IDEMPOTENCY_CONFLICT' if conflict else 'INVALID_INPUT'})
-
-
-def aggregate(project_id):
-    state = store.get(project_id)
-    state['snapshots'] = [dict(id=s['id'], status=s['status'], draft=s.get('draft'), revision=s['plan']['revision'],
-                               created_at=s['created_at'], confirmed_by=s.get('confirmed_by'), reason=s.get('reason'),
-                               snapshot_hash=store.fingerprint(s)) for s in store.snapshots(project_id)]
-    state['jobs'] = store.jobs(project_id)
-    state['audit'] = store.audit(project_id)
-    from .learning import model_status
-    state['learning'] = model_status(store.DATA_ROOT / 'models')
-    state['learning']['training_state'] = state['learning'].get('training_state', state['learning'].get('status', 'no_history'))
-    state['learning']['history_count'] = len(store.snapshots(confirmed_only=True))
-    state['metrics']=domain.plan_metrics(state)
-    return state
-
-
-def submit(project_id, kind, fn):
-    with store.LOCK:
-        for j in store.jobs(project_id):
-            if j['status'] in ('queued', 'running'):
-                raise DomainError('JOB_BUSY', '진행 중인 작업을 완료하거나 취소한 뒤 다시 시도해 주세요.')
-        job = dict(id=store.uid('job-'), project_id=project_id, kind=kind, status='queued', progress=0,
-                   message='작업 대기 중', created_at=store.now(), error=None)
-        event = threading.Event()
-        CANCEL[job['id']] = event
-        store.put_job(job)
-
-    def progress(value, message=''):
-        job.update(progress=round(float(value), 4), message=message or job['message'])
-        if event.is_set():
-            job['message'] = '취소 요청됨 · 현재 계산 종료 대기'
-        store.put_job(job)
-
-    def run():
-        job.update(status='running', started_at=store.now())
-        store.put_job(job)
-        try:
-            result = fn(progress, event.is_set)
-            if event.is_set():
-                raise DomainError('JOB_CANCELED', '작업을 취소했습니다.')
-            job.update(status='succeeded', progress=1, message='작업 완료', result=result or {})
-            if isinstance(result, dict):
-                for k in ('output_url', 'video_path', 'package_url', 'publish_status', 'snapshot_id'):
-                    if k in result:
-                        job[k] = result[k]
-        except Exception as exc:
-            code = getattr(exc, 'code', 'WORKER_FAILED')
-            job.update(status='canceled' if code == 'JOB_CANCELED' or event.is_set() else 'failed',
-                       message=str(exc), error=code, details=getattr(exc, 'details', []), diagnostic_id=job['id'])
-            logs = store.DATA_ROOT / 'logs'
-            logs.mkdir(parents=True, exist_ok=True)
-            (logs / (job['id'] + '.log')).write_text(traceback.format_exc(), encoding='utf-8')
+def create_app(data_dir=None,resources=None):
+    release=release_info()
+    from .release import default_data_dir
+    root=Path(data_dir or default_data_dir())
+    resource_dir=Path(resources or os.environ.get("PILOT_RESOURCE_DIR") or RESOURCE_ROOT)
+    @asynccontextmanager
+    async def lifespan(app):
+        services=Services(root,resource_dir,release);app.state.services=services
+        try:yield
         finally:
-            job['ended_at'] = store.now()
-            store.put_job(job)
-            CANCEL.pop(job['id'], None)
-    POOL.submit(run)
-    return {'job_id': job['id']}
+            import asyncio
+            await asyncio.to_thread(services.close)
+    app=FastAPI(title="PILOT Studio",version=release["version"],lifespan=lifespan)
+    def service():return app.state.services
 
+    @app.middleware("http")
+    async def authenticated(request:Request,call_next):
+        host=request.headers.get("host","").split(":")[0]
+        if host not in ("127.0.0.1","localhost","testserver"):
+            return JSONResponse(status_code=403,content={"detail":"로컬 주소만 사용할 수 있습니다."})
+        origin=request.headers.get("origin")
+        if origin and not re.fullmatch(r"https?://(127\.0\.0\.1|localhost)(:\d+)?",origin):
+            return JSONResponse(status_code=403,content={"detail":"외부 사이트의 요청은 허용되지 않습니다."})
+        token=request.headers.get("X-Pilot-Token") or request.cookies.get("pilot_session")
+        bootstrap=request.query_params.get("token") if request.url.path=="/" else None
+        public=request.url.path=="/api/health" or not request.url.path.startswith("/api/")
+        if not public and not secrets.compare_digest(str(token or ""),service().token):
+            return JSONResponse(status_code=401,content={"detail":"앱 연결이 만료되었습니다. 프로그램을 다시 열어 주세요."})
+        response=await call_next(request)
+        if bootstrap and secrets.compare_digest(bootstrap,service().token):
+            response.set_cookie("pilot_session",bootstrap,httponly=True,samesite="strict")
+        response.headers["X-Content-Type-Options"]="nosniff"
+        return response
 
-def commit_result(project_id, initial, updated, action):
-    with store.LOCK:
-        current = store.get(project_id)
-        if current['plan'].get('status') == 'confirmed' or current['plan'].get('snapshot_id') != initial['plan'].get('snapshot_id') or domain.input_fingerprint(current) != domain.input_fingerprint(initial):
-            raise DomainError('REVISION_CONFLICT', '계산 도중 입력이 변경되어 결과를 반영하지 않았습니다. 다시 실행해 주세요.')
-        store.save(updated, action)
+    @app.exception_handler(DomainError)
+    async def domain_error(_,exc):
+        return JSONResponse(status_code=409 if exc.code in ("REVISION_CONFLICT","JOB_BUSY","STALE_RESULT") else 422,
+                            content={"detail":str(exc),"code":exc.code,"details":exc.details})
+    @app.exception_handler(StorageConflict)
+    async def conflict(_,exc):return JSONResponse(status_code=409,content={"detail":str(exc),"current":exc.current})
+    @app.exception_handler(KeyError)
+    async def missing(_,exc):return JSONResponse(status_code=404,content={"detail":"항목을 찾을 수 없습니다.","id":str(exc)})
 
+    @app.get("/api/health")
+    def health():
+        return {**release,"status":"ready","storage":service().store.status(),"pid":os.getpid(),"session_fingerprint":hashlib.sha256(service().token.encode()).hexdigest()}
+    @app.post("/api/shutdown")
+    def shutdown():
+        if SERVER is not None:SERVER.should_exit=True
+        return {"status":"stopping"}
+    @app.get("/api/projects")
+    def projects():return service().store.list_projects()
+    @app.post("/api/projects")
+    def create_project(body:dict=Body(default={})):
+        return service().store.create_project(domain.new_project(body))
+    @app.get("/api/projects/{ident}")
+    def get_project(ident:str):return service().aggregate(ident)
+    @app.patch("/api/projects/{ident}")
+    def update_project(ident:str,body:dict=Body(...)):
+        svc=service()
+        with svc.lock:
+            old=svc.project(ident);project=domain.patch_project(old,body)
+            result=svc.store.save_project(project,old["row_version"],{"kind":"user_edit","before_geometry_hash":domain.geometry_hash(old),"after_geometry_hash":domain.geometry_hash(project),"before_steps":[s["id"] for s in old["plan"].get("steps",[])],"after_steps":[s["id"] for s in project["plan"].get("steps",[])]})
+        return result
 
-@app.get('/api/health')
-def health():
-    return {'status': 'ok', 'service':'pilot-studio-final', 'version': app.version,'spec_version':'1.6', 'data_dir': str(store.DATA_ROOT), 'binding': 'loopback', 'sharing': 'not_configured'}
+    async def receive(upload,folder):
+        filename=(upload.filename or "model.step").replace("\\","/").rsplit("/",1)[-1]
+        if Path(filename).suffix.lower() not in (".stp",".step"):
+            raise DomainError("STEP_EXTENSION","STEP(.stp/.step) 파일을 선택해 주세요.")
+        folder.mkdir(parents=True,exist_ok=True);path=folder/filename;size=0
+        with path.open("xb") as outgoing:
+            while chunk:=await upload.read(1024*1024):
+                size+=len(chunk)
+                if size>2*1024**3:raise DomainError("FILE_LIMIT","개별 STEP 파일은 2 GB 이하로 등록해 주세요.")
+                outgoing.write(chunk)
+            outgoing.flush();os.fsync(outgoing.fileno())
+        await upload.close()
+        return path
 
+    @app.post("/api/projects/{ident}/import")
+    async def import_files(ident:str,assembly:UploadFile=File(...),parts:list[UploadFile]=File(default=[]),expected_revision:int=Form(...)):
+        svc=service();project=svc.project(ident);domain.expect(project,expected_revision)
+        folder=svc.root/"inputs"/uid("input-")
+        assembly_path=await receive(assembly,folder/"assembly")
+        part_paths=[await receive(part,folder/("part-"+str(index))) for index,part in enumerate(parts)]
+        descriptors=[]
+        for index,path in enumerate([assembly_path,*part_paths]):
+            descriptors.append(svc.store.register_file(path,"assembly_step" if index==0 else "part_step",ident))
+        # Keep the last complete model and its source files together until the
+        # new worker succeeds. A failed import cannot relabel the old model.
+        with svc.lock:
+            project=svc.project(ident);domain.expect(project,expected_revision)
+            return svc.jobs.submit(project,"import",{"assembly_path":str(assembly_path),"part_paths":[str(p) for p in part_paths],"source_files":descriptors,"cache_dir":str(svc.root/"cache"/uid()),"timeout_seconds":3600})
 
-@app.get('/api/projects')
-def list_projects():
-    return [s['project'] | {'operation_count': len(s['operations']), 'unit_count': len(s['units']), 'plan_status': s['plan']['status']} for s in store.projects()]
+    @app.get("/api/projects/{ident}/scene")
+    def scene(ident:str):
+        svc=service();model=svc.project(ident).get("model") or {}
+        path=model.get("scene_path")
+        if not path:raise DomainError("SCENE_NOT_READY","표시 모델이 아직 준비되지 않았습니다.")
+        return FileResponse(path_values(path,svc.root),media_type="application/json")
 
+    def computation(ident,kind,body):
+        svc=service();project=svc.project(ident);domain.expect(project,body.get("expected_revision"))
+        if not project.get("model"):raise DomainError("MODEL_REQUIRED","먼저 STEP을 등록해 주세요.")
+        domain.check_rules(project["model"],project["rules"])
+        active=next((m for m in svc.store.get_setting("learning_models",[]) if m.get("active")),None)
+        if active and project.get("part_number") not in active.get("supported_part_numbers",[]):active=None
+        return svc.jobs.submit(project,kind,{"project":project,"ranking_model":active,"cache_dir":str(svc.root/"analysis"/ident),"timeout_seconds":max(120,project["rules"].get("max_seconds",300)*3+60)},body.get("request_id"))
+    @app.post("/api/projects/{ident}/generate")
+    def generate(ident:str,body:dict=Body(...)):return computation(ident,"generate",body)
+    @app.post("/api/projects/{ident}/validate")
+    def validate(ident:str,body:dict=Body(...)):return computation(ident,"validate",body)
+    @app.get("/api/jobs/{ident}")
+    def job(ident:str):
+        result=service().store.get_job(ident)
+        if result is None:raise KeyError(ident)
+        return result
+    @app.post("/api/jobs/{ident}/cancel")
+    def cancel(ident:str):return service().jobs.cancel(ident)
 
-@app.post('/api/projects')
-def create_project(body: dict = Body(default={})):
-    state = domain.new_project(body)
-    store.save(state, 'project_created')
-    return aggregate(state['project']['id'])
+    @app.post("/api/projects/{ident}/confirm")
+    def confirm(ident:str,body:dict=Body(...)):
+        svc=service()
+        with svc.lock:
+            project=svc.project(ident);domain.expect(project,body.get("expected_revision"))
+            if any(j.get("status") in ("queued","running","cancel_requested") for j in svc.store.list_jobs(ident)):
+                raise DomainError("JOB_BUSY","진행 중인 작업이 끝난 후 현재 결과를 확인하고 확정해 주세요.")
+            errors=domain.confirmation_errors(project,release)
+            if errors:raise DomainError("CONFIRMATION_BLOCKED","순서를 확정할 수 없습니다. "+" / ".join(errors[:6]),{"reasons":errors})
+            signature=domain.confirmation_hash(project)
+            for existing in svc.store.snapshots(ident):
+                if existing.get("source_hash")==signature:return existing
+            snapshot={"id":uid("snapshot-"),"status":"CONFIRMED","source_hash":signature,"project":copy.deepcopy(project),"release":release,"confirmed_at":now(),"reviewer":str(body.get("reviewer") or "사용자"),"reason":str(body.get("reason") or "")}
+            snapshot_path=svc.root/"snapshots"/(snapshot["id"]+".json");atomic_json(snapshot_path,snapshot)
+            asset=svc.store.register_file(snapshot_path,"confirmation_snapshot",ident);snapshot["file_id"]=asset["id"]
+            return svc.store.add_snapshot(ident,snapshot,expected_revision=project["row_version"])
 
+    @app.get("/api/projects/{ident}/history")
+    def history(ident:str):
+        svc=service();svc.project(ident)
+        from .learning import build_dataset,reviewed_histories
+        snapshots=svc.store.snapshots(ident);dataset=build_dataset(reviewed_histories(snapshots,svc.store.get_setting("learning_reviews",[])))
+        company=[x for x in svc.store.get_setting("company_evaluations",[]) if x["project_id"]==ident]
+        field=[x for x in svc.store.get_setting("field_tests",[]) if x["project_id"]==ident]
+        learning_settings=svc.store.get_setting("learning_settings",{})
+        models=svc.store.get_setting("learning_models",[])
+        learning={"eligible_count":len(dataset["eligible_confirmations"]),"excluded":dataset["excluded"],"models":models,"active_model":next((m["id"] for m in models if m.get("active")),"휴리스틱"),"company_evaluation_count":len(company),"field_test_count":len(field),"can_train":bool(learning_settings.get("minimum_cases")),"status":"collecting","settings":learning_settings}
+        return {"snapshots":snapshots,"events":svc.store.events(ident),"jobs":svc.store.list_jobs(ident),"learning":learning,"company_evaluations":company,"field_tests":field}
+    @app.get("/api/files/{ident}")
+    def file(ident:str):
+        store=service().store;asset=store.get_file(ident)
+        if not asset:raise KeyError(ident)
+        return FileResponse(store.file_path(ident,verify=True),media_type=mimetypes.guess_type(asset["name"])[0] or "application/octet-stream",filename=asset["name"],content_disposition_type="inline")
 
-@app.get('/api/projects/{project_id}')
-def get_project(project_id: str):
-    return aggregate(project_id)
+    @app.get("/api/templates")
+    def templates():return service().store.get_setting("video_templates",[])
+    @app.post("/api/templates")
+    async def add_template(file:UploadFile=File(...),name:str=Form(...),approved:bool=Form(False),layout:str=Form("custom")):
+        svc=service();filename=(file.filename or "template.png").replace("\\","/").rsplit("/",1)[-1]
+        if Path(filename).suffix.lower() not in (".png",".jpg",".jpeg",".webp"):
+            raise DomainError("TEMPLATE_FORMAT","영상 배경 이미지는 PNG/JPG/WebP로 등록해 주세요.")
+        data=await file.read(20*1024*1024+1)
+        if len(data)>20*1024*1024:raise DomainError("TEMPLATE_SIZE","템플릿 이미지는 20 MB 이하로 등록해 주세요.")
+        from PIL import Image
+        import io
+        try:
+            image=Image.open(io.BytesIO(data));image.verify()
+        except Exception as exc:raise DomainError("TEMPLATE_INVALID","읽을 수 있는 이미지 파일이 아닙니다.") from exc
+        folder=svc.root/"template-import"/uid();folder.mkdir(parents=True);path=folder/filename;path.write_bytes(data)
+        asset=svc.store.register_file(path,"video_template")
+        record={"id":uid("template-"),"name":name,"approved":approved,"revision":1,"layout":layout,"file_id":asset["id"],"background_url":"/api/files/"+asset["id"],"created_at":now(),"fields":["part_name","part_number","torque","caution"]}
+        records=templates();records.append(record);svc.store.set_setting("video_templates",records);return record
+    @app.patch("/api/templates/{ident}")
+    def edit_template(ident:str,body:dict=Body(...)):
+        svc=service();records=templates()
+        for record in records:
+            if record["id"]==ident:
+                for key in ("name","approved","layout","fields"):
+                    if key in body:record[key]=body[key]
+                record["revision"]+=1;svc.store.set_setting("video_templates",records);return record
+        raise KeyError(ident)
 
+    @app.get("/api/projects/{ident}/exports")
+    def exports(ident:str):return service().project(ident).get("exports",[])
+    @app.post("/api/projects/{ident}/exports")
+    def export(ident:str,body:dict=Body(...)):
+        svc=service();project=svc.project(ident);domain.expect(project,body.get("expected_revision"))
+        draft=bool(body.get("draft",False));selected=next((t for t in templates() if t["id"]==body.get("template_id")),None)
+        if not selected:raise DomainError("TEMPLATE_REQUIRED","영상 템플릿을 선택해 주세요.")
+        if not draft and not selected.get("approved"):raise DomainError("TEMPLATE_REVIEW_REQUIRED","회사 양식으로 사용할 템플릿을 검토해 주세요.")
+        snapshots=svc.store.snapshots(ident)
+        snapshot=next((s for s in snapshots if s["id"]==body.get("snapshot_id")),None) if body.get("snapshot_id") else (snapshots[0] if snapshots else None)
+        if not draft and snapshot is None:raise DomainError("CONFIRMATION_REQUIRED","영상 출력 전 순서를 확정해 주세요.")
+        state=project if draft else snapshot["project"]
+        if not state.get("plan",{}).get("steps"):raise DomainError("PLAN_REQUIRED","출력할 조립순서가 없습니다.")
+        if "seconds_per_step" in body:raise DomainError("STEP_TIMING_REQUIRED","영상 시간은 순서 단계의 재생 시간으로 저장한 뒤 확정해 주세요.")
+        settings={"width":int(body.get("width",1280)),"height":int(body.get("height",720)),"fps":int(body.get("fps",24))}
+        if (settings["width"],settings["height"]) not in ((640,360),(1280,720),(1920,1080)) or settings["fps"] not in (12,24,30):
+            raise DomainError("RENDER_SETTINGS","지원하는 영상 크기·프레임·단계 시간을 선택해 주세요.")
+        render_id=uid("render-")
+        render={"id":render_id,"snapshot":state,"snapshot_id":snapshot["id"] if snapshot and not draft else None,"template":copy.deepcopy(selected),"settings":settings,"draft":draft,"project_id":ident,"scene_url":"/api/renders/"+render_id+"/scene","created_at":now()}
+        svc.store.set_setting("render:"+render_id,render)
+        return svc.jobs.submit(project,"export",{"render":render,"render_id":render_id,"base_url":svc.base_url,"token":svc.token,"timeout_seconds":7200})
+    @app.get("/api/renders/{ident}")
+    def render_definition(ident:str):
+        result=service().store.get_setting("render:"+ident)
+        if not result:raise KeyError(ident)
+        return result
+    @app.get("/api/renders/{ident}/scene")
+    def render_scene(ident:str):
+        definition=render_definition(ident)
+        return FileResponse(path_values(definition["snapshot"]["model"]["scene_path"],service().root),media_type="application/json")
 
-@app.get('/api/scenes/{sha}')
-def get_scene(sha: str):
-    if not re.fullmatch(r'[0-9a-f]{64}', sha):
-        raise HTTPException(404)
-    manifest = store.DATA_ROOT / 'cad-cache' / sha / 'manifest.json'
-    if not manifest.exists():
-        raise HTTPException(404, 'CAD 장면을 찾을 수 없습니다.')
-    data = json.loads(manifest.read_text(encoding='utf-8'))
-    from .desktop_storage import resolve_path
-    return FileResponse(resolve_path(data['scene_path']), media_type='application/json')
+    @app.get("/api/settings")
+    def settings():
+        svc=service()
+        return {"release":release,"storage":svc.store.status(),"learning":svc.store.get_setting("learning_settings",{"minimum_cases":None,"automatic_training":False}),"models":svc.store.get_setting("learning_models",[]),"backups":[{**b,"download_url":"/api/backups/"+b["id"]} for b in svc.store.list_backups()]}
+    @app.patch("/api/settings")
+    def save_settings(body:dict=Body(...)):
+        if "learning" in body:
+            learning=body["learning"];minimum=learning.get("minimum_cases")
+            if minimum is not None and (type(minimum) is not int or not 1<=minimum<=1000000):raise DomainError("LEARNING_THRESHOLD","재학습 기준은 1 이상 정수로 입력해 주세요.")
+            service().store.set_setting("learning_settings",learning)
+        return settings()
+    @app.post("/api/backups")
+    def backup():return service().store.backup()
+    @app.get("/api/backups/{ident}")
+    def backup_file(ident:str):
+        record=next((b for b in service().store.list_backups() if b["id"]==ident),None)
+        if not record or not record.get("available"):raise KeyError(ident)
+        return FileResponse(record["path"],filename=Path(record["path"]).name)
 
+    @app.post("/api/restores/upload")
+    async def restore_upload(file:UploadFile=File(...)):
+        import asyncio
+        from .release import storage_anchor
+        svc=service();folder=svc.root/"restore-import"/uid();folder.mkdir(parents=True)
+        archive=folder/"backup.zip";size=0
+        with archive.open("xb") as stream:
+            while chunk:=await file.read(1024*1024):
+                size+=len(chunk)
+                if size>64*1024**3:raise DomainError("BACKUP_TOO_LARGE","복원 파일 크기 제한을 초과했습니다.")
+                stream.write(chunk)
+            stream.flush();os.fsync(stream.fileno())
+        await file.close()
+        destination=storage_anchor(svc.root)/"restored"/uid("restore-")
+        try:result=await asyncio.to_thread(svc.store.restore,archive,destination)
+        except (ValueError,RuntimeError) as exc:raise DomainError("RESTORE_VALIDATION_FAILED","백업 검증 또는 복원에 실패했습니다. 기존 저장소는 유지됩니다.",{"reason":str(exc)}) from exc
+        with svc.lock:
+            restored=svc.store.get_setting("restored_stores",[]);restored.append(result);svc.store.set_setting("restored_stores",restored)
+        return result
 
-@app.get('/api/snapshots/{snapshot_id}')
-def get_snapshot(snapshot_id: str):
-    return store.snapshot(snapshot_id)
+    @app.post("/api/restores/{ident}/activate")
+    def restore_activate(ident:str):
+        from .release import stage_active_storage
+        svc=service()
+        with svc.lock:
+            if any(j.get("status") in ("queued","running","cancel_requested") for j in svc.store.list_jobs()):
+                raise DomainError("JOB_BUSY","진행 중인 작업을 완료하거나 취소한 후 복원 저장소를 적용해 주세요.")
+            record=next((r for r in svc.store.get_setting("restored_stores",[]) if r["id"]==ident),None)
+            if not record:raise KeyError(ident)
+            return stage_active_storage(record["data_dir"],svc.root)
+    @app.post("/api/projects/{ident}/train")
+    def train(ident:str,body:dict=Body(...)):
+        svc=service();project=svc.project(ident);domain.expect(project,body.get("expected_revision"))
+        from .learning import reviewed_histories
+        histories=reviewed_histories(svc.store.snapshots(),svc.store.get_setting("learning_reviews",[]))
+        return svc.jobs.submit(project,"train",{"histories":histories,"settings":svc.store.get_setting("learning_settings",{}),"output_dir":str(svc.root/"models"),"timeout_seconds":600})
 
+    @app.get("/api/projects/{ident}/learning-reviews")
+    def learning_reviews(ident:str):
+        from .learning import decision_id
+        svc=service();svc.project(ident);records=[]
+        for snapshot in svc.store.snapshots(ident):
+            state=snapshot["project"];units={u["id"]:u for u in (state.get("model") or {}).get("units",[])}
+            decisions=[]
+            for decision in state.get("plan",{}).get("decision_trace",[]):
+                feasible=decision.get("feasible_unit_ids",[])
+                if len(feasible)<2:continue
+                decisions.append({"id":decision_id(decision),"installed_ids":decision.get("installed_ids",[]),"feasible_unit_ids":feasible,
+                                  "candidates":[{"unit_id":u,"name":units.get(u,{}).get("name",u),"status":"PASS"} for u in feasible]})
+            records.append({"id":snapshot["id"],"revision":state.get("revision"),"decisions":decisions})
+        return {"snapshots":records,"reviews":[r for r in svc.store.get_setting("learning_reviews",[]) if r.get("project_id")==ident]}
 
-async def save_upload(upload, folder):
-    name = Path((upload.filename or 'unnamed').replace('\\', '/')).name
-    if Path(name).suffix.lower() not in ('.step', '.stp'):
-        raise DomainError('INVALID_INPUT', f'{name}: STEP 파일만 선택해 주세요.')
-    target = folder / store.uid() / name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    size = 0
-    with target.open('wb') as f:
-        while data := await upload.read(1024 * 1024):
-            size += len(data)
-            if size > 512 * 1024 * 1024:
-                raise DomainError('FILE_TOO_LARGE', '초기 버전의 파일당 입력 한도는 512MB입니다.')
-            f.write(data)
-    return target
+    @app.post("/api/projects/{ident}/learning-reviews")
+    def add_learning_review(ident:str,body:dict=Body(...)):
+        from .learning import preference_review
+        svc=service()
+        with svc.lock:
+            snapshot=next((s for s in svc.store.snapshots(ident) if s["id"]==body.get("snapshot_id")),None)
+            if not snapshot:raise KeyError(body.get("snapshot_id"))
+            review=preference_review(snapshot,body);review["project_id"]=ident
+            reviews=svc.store.get_setting("learning_reviews",[]);reviews.append(review);svc.store.set_setting("learning_reviews",reviews)
+            svc.store.append_event(ident,"expert_preference_review",review)
+            return review
 
+    @app.post("/api/learning/models/{ident}/activate")
+    def activate_learning_model(ident:str,body:dict=Body(...)):
+        svc=service()
+        with svc.lock:
+            if not str(body.get("reviewer","")).strip() or not str(body.get("reference","")).strip():raise DomainError("MODEL_REVIEW_REQUIRED","적용 검토자와 근거를 입력해 주세요.")
+            models=svc.store.get_setting("learning_models",[]);model=next((m for m in models if m["id"]==ident),None)
+            if not model or model.get("status") not in ("SHADOW_EVALUATION","APPROVED"):raise DomainError("MODEL_NOT_TRAINED","학습·분리 평가를 완료한 후보 모델을 선택해 주세요.")
+            company=next((e for e in svc.store.get_setting("company_evaluations",[]) if e["id"]==body.get("company_evaluation_id")),{})
+            field=next((e for e in svc.store.get_setting("field_tests",[]) if e["id"]==body.get("field_test_id")),{})
+            for evidence in (company,field):
+                if evidence.get("model_id")!=ident or evidence.get("passed") is not True or not evidence.get("reference"):
+                    raise DomainError("MODEL_EVIDENCE_REQUIRED","해당 모델의 회사 평가·필드테스트 통과 기록과 근거가 필요합니다.")
+            baseline,score=company.get("heuristic_similarity"),company.get("model_similarity")
+            if not all(type(x) in (int,float) and 0<=x<=1 for x in (baseline,score)) or score<=baseline:
+                raise DomainError("MODEL_GAIN_REQUIRED","동일 평가 자료에서 휴리스틱보다 향상된 회사 유사도 결과가 필요합니다.")
+            previous=next((m["id"] for m in models if m.get("active")),None)
+            for m in models:m["active"]=m["id"]==ident
+            model.update(status="APPROVED",activation={**body,"created_at":now()},operational_evaluation="PASS",company_evaluation="PASS",field_test="PASS")
+            svc.store.set_setting("previous_learning_model",previous);svc.store.set_setting("learning_models",models)
+            return {"active_model":ident,"previous_model":previous,"scope":"새 순서 생성의 검증 통과 후보 우선순위"}
 
-@app.post('/api/projects/{project_id}/import')
-async def upload_models(project_id: str, assembly: UploadFile = File(...), parts: list[UploadFile] = File(default=[]), input_mode: str = Form('assembly_only')):
-    initial = store.get(project_id)
-    if initial['plan']['status'] == 'confirmed':
-        raise DomainError('CONFIRMED_IMMUTABLE', '새 초안에서 파일을 교체해 주세요.')
-    if input_mode not in ('assembly_only','assembly_with_parts'):
-        raise DomainError('INVALID_INPUT_MODE','입력 방식을 확인하세요.')
-    if input_mode=='assembly_with_parts' and not parts:
-        raise DomainError('TEMPLATES_REQUIRED','하위 부품 파일을 선택하거나 완제품만 방식으로 변경하세요.')
-    folder = store.DATA_ROOT / 'uploads' / store.uid()
-    folder.mkdir(parents=True, exist_ok=True)
-    assembly_path = await save_upload(assembly, folder)
-    part_paths = [await save_upload(p, folder) for p in parts]
-    def work(progress, cancel):
-        result = compute('import', initial, {'assembly':str(assembly_path),'parts':[str(p) for p in part_paths]}, progress, cancel)
-        result['project']['input_mode']=input_mode
-        commit_result(project_id, initial, result, 'models_imported')
-        return {'status': result['project']['status']}
-    return submit(project_id, 'import', work)
+    @app.post("/api/learning/rollback")
+    def rollback_learning(body:dict=Body(...)):
+        if not str(body.get("reviewer","")).strip() or not str(body.get("reason","")).strip():raise DomainError("ROLLBACK_REASON","복귀 요청자와 사유를 입력해 주세요.")
+        svc=service()
+        with svc.lock:
+            models=svc.store.get_setting("learning_models",[])
+            for model in models:model["active"]=False
+            svc.store.set_setting("learning_models",models);svc.store.set_setting("learning_rollback",{**body,"created_at":now()})
+            return {"active_model":"휴리스틱"}
+    @app.post("/api/projects/{ident}/evaluations")
+    def evaluation(ident:str,body:dict=Body(...)):
+        svc=service();svc.project(ident)
+        kind=body.get("kind")
+        if kind not in ("company_evaluation","field_test"):raise DomainError("EVALUATION_KIND","회사 평가 또는 필드테스트를 선택해 주세요.")
+        if not str(body.get("reviewer","")).strip() or not str(body.get("result","")).strip():raise DomainError("EVALUATION_DETAILS","검토자와 실제 평가 결과를 입력해 주세요.")
+        record={**body,"id":uid("evaluation-"),"project_id":ident,"created_at":now()}
+        key="company_evaluations" if kind=="company_evaluation" else "field_tests"
+        values=svc.store.get_setting(key,[]);values.append(record);svc.store.set_setting(key,values);svc.store.append_event(ident,kind,record);return record
 
-
-@app.post('/api/projects/{project_id}/metadata')
-async def import_metadata(project_id: str, file: UploadFile = File(...)):
-    raw = await file.read()
-    try:
-        rows = list(csv.DictReader(io.StringIO(raw.decode('utf-8-sig'))))
-    except (UnicodeError, csv.Error):
-        raise DomainError('INVALID_CSV', 'UTF-8 CSV 파일을 사용해 주세요.')
-    if not rows or not {'id', 'company_part_no', 'display_name'} <= set(rows[0]):
-        raise DomainError('INVALID_CSV', '필수 열: id, company_part_no, display_name (cad_aliases 선택).')
-    if len({r['id'] for r in rows}) != len(rows):
-        raise DomainError('DUPLICATE_KEY', 'CSV에 같은 품목 ID가 중복되었습니다.')
-    with store.LOCK:
-        state = store.get(project_id)
-        known = {p['id']: p for p in state['parts']}
-        if any(r['id'] not in known for r in rows):
-            raise DomainError('INVALID_REFERENCE', 'CSV에 없는 품목 ID가 있습니다.')
-        domain.invalidate(state, 'CSV 메타데이터 변경')
-        for row in rows:
-            part = known[row['id']]
-            part.update(company_part_no=row['company_part_no'], display_name=row['display_name'], metadata_status='provided', metadata_source=file.filename)
-            if row.get('cad_aliases'):
-                part['cad_aliases'] = row['cad_aliases'].split('|')
-        sync_parts(state)
-        state['versions']['metadata'] += 1
-        store.save(state, 'metadata_imported', {'rows': len(rows)})
-    return aggregate(project_id)
-
-
-@app.get('/api/projects/{project_id}/metadata.csv')
-def export_metadata(project_id: str):
-    from fastapi.responses import Response
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=['id', 'company_part_no', 'display_name', 'cad_aliases'])
-    writer.writeheader()
-    for p in store.get(project_id)['parts']:
-        writer.writerow(dict(id=p['id'], company_part_no=p.get('company_part_no') or '', display_name=p['display_name'], cad_aliases='|'.join(p.get('cad_aliases', []))))
-    return Response('\ufeff' + buf.getvalue(), media_type='text/csv; charset=utf-8', headers={'Content-Disposition': 'attachment; filename="metadata.csv"'})
-
-
-def sync_parts(state):
-    parts = {p['id']: p for p in state['parts']}
-    units = {u['id']: u for u in state['units']}
-    for unit in units.values():
-        if unit['part_definition_id'] in parts:
-            unit['part_no'] = parts[unit['part_definition_id']].get('company_part_no')
-    for op in state['operations']:
-        targets = op.get('target_unit_ids', [])
-        if len(targets) == 1 and targets[0] in units and op['kind'] in domain.INSERT_KINDS:
-            unit = units[targets[0]]
-            op.update(part_no=unit.get('part_no'), part_name=parts.get(unit['part_definition_id'], {}).get('display_name', unit['name']))
-
-
-@app.post('/api/projects/{project_id}/actions/{action}')
-def action(project_id: str, action: str, body: dict = Body(default={})):
-    with store.LOCK:
-        state = store.get(project_id)
-        initial = copy.deepcopy(state)
-        expected=body.get('expected_revision',body.get('revision'))
-        if expected is not None and expected!=state['plan']['revision']:
-            raise DomainError('REVISION_CONFLICT','현재 초안이 변경됐습니다. 최신 상태를 확인하세요.')
-        if action=='preview_move':
-            return domain.preview_move(state,body.get('operation_id'),body.get('target_index'))
-        if state['plan']['status'] == 'confirmed' and action in ('load_sample', 'generate', 'validate'):
-            raise DomainError('CONFIRMED_IMMUTABLE', '확정본을 유지합니다. 새 초안을 만든 뒤 편집·재검증해 주세요.')
-        if action in ('generate', 'validate'):
-            def work(progress, cancel):
-                result = compute(action, initial, body, progress, cancel)
-                commit_result(project_id, initial, result, action)
-                return {'status': result['plan']['status']}
-            return submit(project_id, action, work)
-        if action == 'train':
-            def work(progress, cancel):
-                from .learning import train
-                histories = store.snapshots(confirmed_only=True)
-                progress(.1, f'확정 이력 {len(histories)}건 분석')
-                result = train(histories, store.DATA_ROOT / 'models')
-                progress(1, result.get('reason', '학습 상태 갱신'))
-                return result
-            return submit(project_id, 'train', work)
-        if action == 'confirm':
-            if state['plan']['status'] == 'confirmed':
-                return aggregate(project_id)
-            snapshot = domain.make_snapshot(state, body.get('reviewer'), body.get('reason', ''))
-            snapshot['constraints'] = state['rules']
-            store.put_snapshot(snapshot, True, {'reason': body.get('reason', ''), 'baseline_order': state['baseline'], 'final_order': state['plan']['ordered_operation_ids'], 'label_source': 'user_confirmation'})
-            state['plan'].update(status='confirmed', snapshot_id=snapshot['id'], confirmed_by=body['reviewer'], confirmed_at=store.now())
-            store.save(state, 'plan_confirmed', {'snapshot_id': snapshot['id']})
-            return aggregate(project_id)
-        if action == 'new_draft':
-            old = state['plan']
-            state['plan'] = copy.deepcopy(old) | dict(id=store.uid('plan-'), revision=old['revision'] + 1, status='draft', origin=old.get('origin','manual'), parent_plan_id=old['id'], reason=body.get('reason', '확정본에서 파생'))
-            state['plan'].pop('snapshot_id', None)
-            state['validation'] = None
-            store.save(state, 'draft_created')
-            return aggregate(project_id)
-        if action == 'render':
-            from .exporter import render_video
-            snapshot_id = body.get('snapshot_id') or state['plan'].get('snapshot_id')
-            if snapshot_id:
-                snapshot = store.snapshot(snapshot_id)
-                if snapshot['project']['id'] != project_id:
-                    raise DomainError('INVALID_REFERENCE', '다른 프로젝트의 스냅샷입니다.')
-            elif body.get('draft'):
-                snapshot = domain.make_snapshot(state, draft=True)
-                store.put_snapshot(snapshot, False)
-            else:
-                raise DomainError('REVIEW_REQUIRED', '공식 출력은 확정본이 필요합니다. 검토 중인 계획은 초안 출력으로 진행해 주세요.')
-            def work(progress, cancel):
-                folder = store.DATA_ROOT / 'exports' / snapshot['id'] / store.uid('render-')
-                result = render_video(f'http://127.0.0.1:{SERVER_PORT}', snapshot, folder,
-                                      preset='production' if body.get('preset', 'full') == 'full' else 'quick',
-                                      progress=progress, cancel=cancel)
-                video = Path(result['video_path'])
-                result.update(output_url='/artifacts/' + video.relative_to(store.DATA_ROOT / 'exports').as_posix(), snapshot_id=snapshot['id'])
-                return result
-            return submit(project_id, 'render', work)
-        if action == 'package':
-            from .exporter import web_package
-            job = next((j for j in store.jobs(project_id) if j['id'] == body.get('job_id')), None)
-            if not job or job['kind'] != 'render' or job['status'] != 'succeeded':
-                raise DomainError('RENDER_REQUIRED', '성공한 MP4 출력 작업을 선택해 주세요.')
-            snapshot = store.snapshot(job['result']['snapshot_id'])
-            target = store.DATA_ROOT / 'exports' / snapshot['id'] / store.uid('web-')
-            result = web_package(job['result'], snapshot, target)
-            package = Path(result.get('zip_path') or result.get('package_path'))
-            result['package_url'] = '/artifacts/' + package.relative_to(store.DATA_ROOT / 'exports').as_posix()
-            job['result'].update(result)
-            job.update(package_url=result['package_url'], publish_status='not_published')
-            store.put_job(job)
-            return aggregate(project_id)
-        if action == 'cancel_job':
-            job_id = body.get('job_id')
-            if job_id not in {j['id'] for j in store.jobs(project_id)}:
-                raise DomainError('INVALID_REFERENCE', '작업을 찾을 수 없습니다.')
-            if job_id in CANCEL:
-                CANCEL[job_id].set()
-            return aggregate(project_id)
-        if action == 'save_plan':
-            if body.get('revision') != state['plan']['revision']:
-                raise DomainError('REVISION_CONFLICT', '초안 개정이 변경되었습니다. 새로 불러온 뒤 수정해 주세요.')
-            ids = body.get('ordered_operation_ids', [])
-            known = {o['id'] for o in state['operations']}
-            if any(i not in known for i in ids) or len(set(ids)) != len(ids):
-                raise DomainError('INVALID_PLAN', '중복 또는 없는 작업이 포함되어 있습니다.')
-            positions={oid:n for n,oid in enumerate(ids)}
-            violations=[r for r in state['rules'] if r.get('strength','hard')=='hard' and r['before_operation_id'] in positions and r['after_operation_id'] in positions and positions[r['before_operation_id']]>=positions[r['after_operation_id']]]
-            if violations:raise DomainError('PRECEDENCE_VIOLATION','필수 선행 규칙을 위반하는 순서입니다.',violations)
-            for op in state['operations']:
-                if op.get('asap_path'):op['path_validity']='stale'
-                if op.get('asap_motion'):op['asap_motion']['validity']='stale'
-            if state['plan'].get('asap_run_id'):state['plan']['asap_path_stale']=True
-            domain.invalidate(state, body.get('reason', '사용자 순서 편집'))
-            state['plan'].update(ordered_operation_ids=ids, origin='manual')
-        elif action == 'update_operation':
-            operation = next((o for o in state['operations'] if o['id'] == body.get('id')), None)
-            if not operation:
-                raise DomainError('INVALID_REFERENCE', '작업을 찾을 수 없습니다.')
-            initial_op=copy.deepcopy(operation)
-            allowed = {'title', 'group_id', 'kind', 'target_unit_ids', 'part_no', 'part_name', 'direction', 'duration_s', 'torque', 'warning', 'camera_id', 'source_ref', 'review_status','tool_id','tool_axis','fastening_stage','access_review','height_offset_mm','recommended_directions','motion_distance_mm','tool_contact_point_mm'}
-            patch = {k:v for k,v in body.items() if k in allowed}
-            if 'duration_s' in patch and (not isinstance(patch['duration_s'], (int,float)) or not math.isfinite(patch['duration_s']) or not .1 <= patch['duration_s'] <= 120):
-                raise DomainError('INVALID_DURATION', '재생 시간은 0.1~120초로 입력해 주세요.')
-            if patch.get('direction', '+Z') not in domain.DIRECTIONS or patch.get('kind', operation['kind']) not in domain.KINDS:
-                raise DomainError('INVALID_INPUT', '지원하지 않는 작업 종류 또는 방향입니다.')
-            domain.validate_operation(state,operation|patch)
-            domain.invalidate(state, body.get('reason', '작업 정보 변경'))
-            target_changed = 'target_unit_ids' in patch and patch['target_unit_ids'] != operation.get('target_unit_ids')
-            operation.update(patch)
-            if operation.get('asap_path') and any(k in patch for k in ('direction','target_unit_ids','height_offset_mm','motion_distance_mm')):
-                operation['path_validity']='stale'
-            if operation.get('asap_motion') and any(k in patch and patch[k]!=initial_op.get(k) for k in ('direction','target_unit_ids','height_offset_mm','motion_distance_mm','kind','fastening_stage')):
-                operation['asap_motion']['validity']='stale';state['plan']['asap_path_stale']=True
-                if any(k in patch and patch[k]!=initial_op.get(k) for k in ('motion_distance_mm','height_offset_mm')):
-                    operation['asap_motion']['parameters_changed']=True
-            if target_changed:
-                sync_parts(state)
-                operation.update(torque=None, warning={'status':'missing','text':'','source_ref':None}, review_status='review_required')
-            state['versions']['metadata'] += 1
-        elif action == 'create_operation':
-            domain.invalidate(state, '작업 정의 추가')
-            operation = dict(id=store.uid('op-'), title=body.get('title') or '새 작업', kind=body.get('kind', 'place'),
-                             target_unit_ids=body.get('target_unit_ids', []), group_id=body.get('group_id', 'manual'),
-                             part_no=None, part_name='', direction=body.get('direction', '+Z'), duration_s=body.get('duration_s', 3),
-                             torque=body.get('torque'), warning=body.get('warning', {'status':'missing','text':''}),
-                             source_ref='사용자 등록', review_status='review_required')
-            for key in ('part_no','part_name','tool_id','fastening_stage','access_review'):
-                if key in body:operation[key]=body[key]
-            domain.validate_operation(state,operation)
-            state['operations'].append(operation)
-            state['baseline'].append(operation['id'])
-            state['plan']['ordered_operation_ids'].append(operation['id'])
-            sync_parts(state)
-        elif action == 'delete_operation':
-            oid = body.get('id')
-            if any(r['before_operation_id'] == oid or r['after_operation_id'] == oid for r in state['rules']):
-                raise DomainError('REFERENCED_OPERATION', '규칙이 참조하는 작업입니다. 해당 규칙을 먼저 수정해 주세요.')
-            domain.invalidate(state, '작업 정의 삭제')
-            state['operations'] = [o for o in state['operations'] if o['id'] != oid]
-            state['baseline'] = [i for i in state['baseline'] if i != oid]
-            state['plan']['ordered_operation_ids'] = [i for i in state['plan']['ordered_operation_ids'] if i != oid]
-        elif action == 'save_rules':
-            rules = body.get('rules', [])
-            domain.check_rules(state['operations'], rules)
-            domain.invalidate(state, '공정 규칙 변경')
-            state['rules'] = [r | {'id': r.get('id') or store.uid('rule-')} for r in rules]
-            state['versions']['rules'] += 1
-        elif action=='tool_update':
-            tools=state.setdefault('tools',[])
-            tool=next((t for t in tools if t['id']==body.get('id')),None)
-            if body.get('id') and not tool:raise DomainError('INVALID_TOOL','공구를 찾을 수 없습니다.')
-            item={k:v for k,v in body.items() if k in {'name','manufacturer','model','type','assembly_id','envelope','change_time_s','source_ref','reviewed'}}
-            item={'type':'manual','change_time_s':0.,'reviewed':False,**(tool or {}),**item}
-            if not str(item.get('name','')).strip() or item['type'] not in ('manual','powered','fixture','none'):
-                raise DomainError('INVALID_TOOL','공구명과 유형을 확인하세요.')
-            seconds=item['change_time_s']
-            if isinstance(seconds,bool) or not isinstance(seconds,(int,float)) or not math.isfinite(seconds) or not 0<=seconds<=3600:
-                raise DomainError('INVALID_TOOL','공구 교체 시간은 0~3600초입니다.')
-            if item.get('envelope'):
-                for key in ('radius_mm','length_mm'):
-                    v=item['envelope'].get(key)
-                    if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or v<=0:
-                        raise DomainError('INVALID_TOOL','공구 외형의 반경과 길이는 양수 mm로 입력하세요.')
-            domain.invalidate(state,'공구 구성 변경');state['versions']['metadata']+=1
-            if tool:tool.update(item)
-            else:tools.append(item|{'id':store.uid('tool-')})
-        elif action=='tool_delete':
-            if any(op.get('tool_id')==body.get('id') for op in state['operations']):
-                raise DomainError('REFERENCED_TOOL','작업이 참조하는 공구입니다. 먼저 작업의 공구를 변경하세요.')
-            domain.invalidate(state,'공구 제거')
-            state['tools']=[t for t in state.get('tools',[]) if t['id']!=body.get('id')]
-        elif action=='save_exception':
-            if body.get('kind') not in ('contact_review','flexible_process') or not body.get('reviewer') or not str(body.get('reason','')).strip():
-                raise DomainError('INVALID_EXCEPTION','예외 유형·검토자·구체적인 근거를 입력하세요.')
-            if body.get('operation_id') not in {o['id'] for o in state['operations']}:
-                raise DomainError('INVALID_REFERENCE','예외의 작업을 선택하세요.')
-            if not set(body.get('unit_ids',[]))<={u['id'] for u in state['units']}:
-                raise DomainError('INVALID_REFERENCE','예외 단위를 확인하세요.')
-            op=next(o for o in state['operations'] if o['id']==body['operation_id'])
-            if set(body.get('unit_ids',[]))!=set(op.get('target_unit_ids',[])):
-                raise DomainError('INVALID_EXCEPTION','검토 범위는 해당 작업의 대상 단위와 정확히 같아야 합니다.')
-            if body['kind']=='flexible_process' and op['kind']!='install_flexible':
-                raise DomainError('INVALID_EXCEPTION','유연체 공정 검토는 유연체 설치 작업에만 적용합니다.')
-            domain.invalidate(state,'범위 한정 공정 검토 기록')
-            state['exceptions'].append({k:body.get(k) for k in ('operation_id','unit_ids','kind','reviewer','reason')}|{'id':store.uid('exception-'),'created_at':store.now(),'scope':'review_record_only_no_collision_bypass','scope_hash':domain.exception_scope(state,op)})
-            state['versions']['exceptions']+=1
-        elif action == 'confirm_mapping':
-            if not str(body.get('reviewer', '')).strip():
-                raise DomainError('MISSING_REVIEWER', '대응 검토자를 입력해 주세요.')
-            selected = set(body.get('unit_ids', []))
-            if not selected or not selected <= {u['id'] for u in state['units']}:
-                raise DomainError('INVALID_REFERENCE', '검토할 조립 단위를 선택해 주세요.')
-            domain.invalidate(state, 'CAD 대응 검토')
-            for unit in state['units']:
-                if unit['id'] in selected:
-                    part = next(p for p in state['parts'] if p['id'] == unit['part_definition_id'])
-                    if not part.get('company_part_no'):
-                        raise DomainError('MISSING_METADATA', '공식 품번을 먼저 입력해 주세요.')
-                    unit.update(mapping_status='confirmed', reviewer=body['reviewer'], reviewed_at=store.now())
-            state['versions']['mapping'] += 1
-            if all(u['mapping_status'] == 'confirmed' for u in state['units']) and all(f['parse_status'] not in ('failed','partial') for f in state['files'] if f['input_revision'] == state['project']['input_revision']):
-                state['project']['status'] = 'ready'
-        elif action == 'save_units':
-            units = body.get('units', [])
-            members = [m for u in units for m in u.get('member_instance_ids', [])]
-            if len(members) != len(set(members)) or set(members) != {i['id'] for i in state['instances']}:
-                raise DomainError('INVALID_MEMBERSHIP', '각 CAD 배치는 정확히 하나의 조립 단위에 포함되어야 합니다.')
-            if len({u['id'] for u in units}) != len(units) or any(not u.get('member_instance_ids') for u in units):
-                raise DomainError('INVALID_UNITS', '단위 ID 중복 또는 빈 단위가 있습니다.')
-            part_ids = {p['id'] for p in state['parts']}
-            if any(u.get('part_definition_id') not in part_ids for u in units):
-                raise DomainError('INVALID_REFERENCE', '품목 정의에 없는 단위가 있습니다.')
-            domain.invalidate(state, '조립 단위 묶음 변경')
-            state['units'] = [u | {'mapping_status':'candidate','reviewer':None} for u in units]
-            state['versions']['mapping'] += 1
-            state['project']['status'] = 'mapping_required'
-            if state['plan'].get('asap_run_id'):state['plan']['asap_path_stale']=True
-        elif action == 'update_project':
-            domain.invalidate(state, '제품 정보 변경')
-            for key in ('name','vehicle_model','item_name','product_no'):
-                if key in body:
-                    state['project'][key] = str(body[key])
-            state['versions']['metadata'] += 1
-        elif action == 'update_part':
-            part = next((p for p in state['parts'] if p['id'] == body.get('id')), None)
-            if not part:
-                raise DomainError('INVALID_REFERENCE', '품목을 찾을 수 없습니다.')
-            domain.invalidate(state, '품목 메타데이터 변경')
-            part.update({k:v for k,v in body.items() if k in ('company_part_no','display_name','cad_aliases','metadata_source')})
-            part['metadata_status'] = 'provided'
-            sync_parts(state)
-            state['versions']['metadata'] += 1
-        else:
-            raise HTTPException(404, '지원하지 않는 동작입니다.')
-        domain.refresh_asap_validity(state)
-        add_features(state)
-        store.save(state, action, {'plan_revision': state['plan']['revision']})
-    return aggregate(project_id)
-
-
-from . import asap_integration
-app.include_router(asap_integration.router)
-app.mount('/api/asap', asap_integration.app)
-from .storage_routes import router as storage_router
-app.include_router(storage_router)
-from .commands import router as command_router
-app.include_router(command_router)
-store.DATA_ROOT.joinpath('exports').mkdir(parents=True, exist_ok=True)
-app.mount('/artifacts', StaticFiles(directory=store.DATA_ROOT / 'exports'), name='artifacts')
-FRONTEND = store.RESOURCE_ROOT / 'frontend' / 'dist'
-if FRONTEND.exists():
-    app.mount('/', StaticFiles(directory=FRONTEND, html=True), name='frontend')
+    frontend=RESOURCE_ROOT/"frontend"/"dist"
+    if not frontend.is_dir():frontend=PROJECT_ROOT/"frontend"/"dist"
+    app.mount("/assets",StaticFiles(directory=frontend/"assets",check_dir=False),name="assets")
+    app.mount("/fonts",StaticFiles(directory=frontend/"fonts",check_dir=False),name="fonts")
+    @app.get("/")
+    def index():
+        if not (frontend/"index.html").is_file():raise HTTPException(503,"화면 빌드가 없습니다. 설치 패키지를 복구해 주세요.")
+        return FileResponse(frontend/"index.html",headers={"Cache-Control":"no-store"})
+    return app
 
 
 def run():
-    global SERVER_PORT
-    parser = argparse.ArgumentParser(description='PILOT Studio local desktop application')
-    parser.add_argument('--port', type=int, default=SERVER_PORT)
-    parser.add_argument('--no-browser', action='store_true')
-    parser.add_argument('--self-test', action='store_true')
-    args = parser.parse_args()
-    SERVER_PORT = args.port
-    if args.self_test:
-        from .cad import ALGORITHM_VERSION, SETTINGS
-        print(json.dumps({'version':app.version,'cad':ALGORITHM_VERSION,'settings':SETTINGS,'data_dir':str(store.DATA_ROOT)}, ensure_ascii=True))
-        return
+    global SERVER
     import uvicorn
-    uvicorn.run(app, host='127.0.0.1', port=SERVER_PORT, log_level='info')
+    release=release_info()
+    expected=os.environ.get("PILOT_BUILD_ID")
+    if expected and expected!=release["build_id"]:raise RuntimeError("BUILD_ID_MISMATCH: 실행 구성 요소의 버전이 다릅니다.")
+    app=create_app()
+    SERVER=uvicorn.Server(uvicorn.Config(app,host="127.0.0.1",port=int(os.environ.get("PILOT_PORT","8772")),log_level="info",access_log=False))
+    SERVER.run()
 
 
-if __name__ == '__main__':
-    run()
+if __name__=="__main__":run()

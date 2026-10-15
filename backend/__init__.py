@@ -1,1 +1,1 @@
-"""PILOT Studio local application."""
+"""PILOT Studio application services."""

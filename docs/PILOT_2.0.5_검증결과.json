@@ -1,0 +1,81 @@
+{
+  "format": "pilot-verification/1",
+  "app_version": "2.0.5",
+  "build_id": "pilot-2.0.5-20261014T134453Z",
+  "spec_version": "0.6",
+  "regression": {
+    "passed": 49,
+    "failed": 0
+  },
+  "actual_hvjb": {
+    "source": "KD1_HVJB_91958-KD000.stp",
+    "source_sha256": "3048cab7cc1dd38b1a39af1084f645c34fe91514aa88ee97e2144273b68bc2fe",
+    "part_step_files": 18,
+    "occurrences": 78,
+    "solids": 176,
+    "assembly_units": 56,
+    "sequence_steps": 55,
+    "coverage_complete": true,
+    "sequence_generated": true,
+    "whole_assembly_verified": false,
+    "validation_status": "BLOCKED",
+    "model_quality": "LIMITED",
+    "exact_method_review_occurrences": 6,
+    "checks": [
+      "78 physical occurrences partitioned exactly once",
+      "All 78 occurrence meshes returned by actual API",
+      "Every moving assembly unit appears exactly once",
+      "Unverified physical plan cannot be confirmed"
+    ],
+    "review_backup_verified": true,
+    "sealed_payload_unchanged": true,
+    "ui_javascript_errors": []
+  },
+  "synthetic_workflow": {
+    "status": "PASS",
+    "checks": {
+      "step_import_three_occurrences": true,
+      "generated_complete_PASS": true,
+      "confirmation_numeric_torque_object": true,
+      "unreviewed_confirmation_excluded_from_learning": true,
+      "formal_mp4_full_decode": true,
+      "video_export_preserves_current_confirmation": true,
+      "edited_path_requires_revalidation": true,
+      "edited_plan_revalidation_PASS": true,
+      "failed_import_preserves_matching_original_and_model": true
+    },
+    "frames": 18,
+    "decoded_frames": 18,
+    "last_frame_time_seconds": 1.5,
+    "sealed_payload_unchanged": true,
+    "scope": "synthetic fixture; not company or actual product assembly approval"
+  },
+  "desktop": {
+    "model_view_played": true,
+    "javascript_errors": [],
+    "successful_restarts": 2,
+    "sealed_payload_unchanged": true
+  },
+  "native_update": {
+    "from_build": "pilot-2.0.2-20261014T125649Z",
+    "to_build": "pilot-2.0.5-20261014T134453Z",
+    "project_and_revision_preserved": true,
+    "backup_count": 2,
+    "failed_update_preserved_previous_release_and_data": true,
+    "scope": "isolated native package/data folders; no legacy installation or registry migration test"
+  },
+  "remaining_acceptance": [
+    "actual product final overlap and representation review",
+    "unresolved complex paths",
+    "company template and process data approval",
+    "separate clean-PC acceptance",
+    "company ML comparison and field tests"
+  ],
+  "remaining_implementation": [
+    "detailed process editor",
+    "debounced validation scheduling",
+    "free template field layout",
+    "historical snapshot/template selection UI",
+    "whole-plan ML comparison and company evaluation-request export"
+  ]
+}

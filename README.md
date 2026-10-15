@@ -1,81 +1,117 @@
-# 15-thn_project · PILOT Studio
+# PILOT Studio 2.0.5
 
-STEP CAD를 등록하고 조립단위를 정한 뒤, ASAP 조립순서와 실제 이동 경로를 분석하고 3D로 검토하는 Windows 프로그램입니다. 공정 편집, 검증·확정, 영상 출력과 프로젝트 백업 기능을 제공합니다.
+완제품 STEP과 부품 STEP을 대응시켜 조립 단위를 만들고, 자체 간섭 검사로 조립순서를 추천·편집·재검증하는 Windows 프로그램입니다. 왼쪽 메뉴, 중앙 3D, 오른쪽 작업 정보와 하단 순서 카드를 유지했습니다.
 
-## 팀원: 설치해서 실행하기
+**팀원은 아래 설치 파일만 받아 실행하면 됩니다. Python·Node.js·MariaDB를 따로 설치할 필요가 없습니다.**
 
-**[설치파일 다운로드 — PILOT-Studio-Setup-1.0.0.exe](https://github.com/gyuwon-k/15-thn_project/releases/download/installer-v1.0.0/PILOT-Studio-Setup-1.0.0.exe)**
+## 바로 설치하기
 
-[배포 페이지](https://github.com/gyuwon-k/15-thn_project/releases/tag/installer-v1.0.0) · [팀원 설치·사용 안내](docs/TEAM_SETUP.md)
+1. [2.0.5 설치 파일 다운로드](https://github.com/gyuwon-k/15-thn_project/releases/download/v2.0.5/PILOT-Studio-2.0.5-Setup.exe)를 받습니다. 약 742 MB이며 CAD·DB·브라우저·영상 인코더가 포함되어 있습니다.
+2. 설치 파일을 실행한 뒤 **PILOT Studio** 바로가기를 엽니다. Windows x64용입니다.
+3. **저장소·환경**에서 앱 버전 `2.0.5`와 빌드 `pilot-2.0.5-20261014T134453Z`를 확인합니다.
+4. **프로젝트**에서 차종·품목·품번을 입력하고 **모델·조립 순서**에서 완제품 STEP 및 필요한 부품 STEP을 등록합니다.
 
-1. Windows 10/11 **64비트(x64)** PC에서 위 설치파일을 다운로드합니다.
-2. **PILOT-Studio-Setup-1.0.0.exe**를 실행하고 설치 안내를 따릅니다.
-3. 설치 완료 후 시작 메뉴의 **PILOT Studio**를 실행합니다. 설치 중 바탕화면 바로가기를 선택했다면 그것으로 실행해도 됩니다.
-4. **새 프로젝트 → 모델·부품 대응 → 입력 방식 선택 → 완제품 STEP 등록** 순서로 시작합니다.
+[최신 Release와 전체 다운로드](https://github.com/gyuwon-k/15-thn_project/releases/latest) · [사용 안내](docs/PILOT_2.0.5_사용안내.md) · [구현·검증 보고서](docs/PILOT_2.0.5_구현검증_보고서.md)
 
-설치파일은 약 **1.2GB**, 포함된 프로그램 구성 요소는 약 **3.7GB**입니다. CAD·계산 결과·영상용 공간은 추가로 필요합니다. Python·Node.js·CATIA 개발 환경을 따로 설치하거나 CMD·PowerShell을 실행할 필요는 없습니다. 설치 프로그램이 포함된 구성 요소와 WebView2를 준비합니다.
+설치 파일 SHA-256:
 
-**Code → Download ZIP**과 Releases의 **Source code**는 개발 소스입니다. 실행용 설치파일과 런타임은 들어 있지 않으므로 실행만 하려면 위 설치파일 또는 Releases의 Assets를 이용하세요.
+```text
+01addffb3e2898109e32ab9e3577a056b0418fbc35f1d966ab2634f045b3f668
+```
 
-### 배포 버전과 확인 범위
+PowerShell에서 확인할 수 있습니다.
 
-현재 파일은 **PILOT Studio 1.0.0 · 2026-10-12 검증 설치본**이며 GitHub에서는 사전 배포(Pre-release)로 표시합니다.
+```powershell
+Get-FileHash -Algorithm SHA256 .\PILOT-Studio-2.0.5-Setup.exe
+```
 
-- 검증 PC에서 설치, 독립 프로그램 창, 전용 DB 연결을 확인했습니다.
-- 검증용 STEP에서 실제 ASAP 순서·경로 생성과 영상·백업을 확인했습니다.
-- 실제 HVJB는 전체 전처리를 확인했지만 **전체 조립순서 성공은 아직 확보하지 않았습니다**. 실제 PRA와 다른 PC에서의 인수도 별도 확인이 필요합니다.
-- **main의 진행 중인 HVJB 개선 사항이 모두 이 설치파일에 포함된 것은 아닙니다.** 소스와 배포본의 기준을 구분하세요.
+## 작업 순서
 
-## CAD 등록과 조립순서 확인
+1. **프로젝트:** 제품 정보를 입력합니다. 품번은 문자열로 저장해 앞자리 0을 유지합니다.
+2. **모델·조립 순서:** STEP 등록 후 부품 대응과 모델 진단을 확인합니다. 품명, 조립 단위 묶기·해제와 고정품을 조정합니다. 표시에서 숨겨도 간섭 검사에는 포함됩니다.
+3. **공정·조립 규칙:** 고정품, 선후 관계, 진입 방향·거리와 계산 예산을 설정합니다.
+4. **순서 생성·편집:** 생성한 카드를 확인하거나 직접 순서를 구성합니다. 카드 드래그 시 재검증하며 방향·거리·규칙을 저장한 뒤에는 재검증 버튼을 누릅니다.
+5. **확정:** 현재 순서 전체가 검증을 통과하고 토크/해당 없음, 주의사항/검토 결과 없음, 작업 정보 검토가 완료되면 확정합니다.
+6. **영상 출력:** 검토한 양식을 선택하고 필요한 시점을 저장한 뒤 MP4를 출력합니다.
+7. **이력·학습:** 수정·확정 이력, 전문가 선호, 회사 평가와 필드테스트 결과를 축적합니다.
 
-1. 새 프로젝트에서 제품 정보를 입력합니다.
-2. **완제품만** 또는 **완제품＋하위 부품**을 선택하고 `.stp` 또는 `.step`을 등록합니다. 하위 부품 방식은 기준 STEP도 추가합니다.
-3. 3D 형상과 매칭 후보를 검토하고 실제 함께 투입할 조립단위를 정해 확정합니다. 반복 볼트·와셔는 위치별 배치 ID로 구분하며 같은 이름만으로 모두 병합하지 않습니다.
-4. **OBJ 변환·자동 전처리**를 실행하고 차단·경고와 문제 단위를 확인합니다.
-5. **ASAP 실행** 후 **전처리 완료 / 전체 순서 생성 / 실제 경로 확보**를 각각 확인합니다.
-6. 완료된 결과를 공정 초안으로 가져와 품목·체결·공구·토크·현장 규칙을 검토하고 3D로 재생합니다.
-7. 순서·대상·경로 조건을 바꿨다면 다시 검증합니다. 최신 검증 후 확정본으로 영상·Web ZIP을 출력합니다.
+## 실제 정션박스 시험 결과와 현재 범위
 
-ASAP **learn**은 사전학습 가중치의 추론이며 신규 GNN 학습이 아닙니다. **heur-out**은 공식 ASAP 휴리스틱 비교입니다. 모든 STEP의 계산 성공이나 모든 제품의 전체 순서 존재를 보장하지 않습니다. 와이어·가스켓 변형과 실제 공구·손·로봇 접근성은 별도 현장 검토가 필요합니다.
+제공된 고전압 정션박스 STEP 및 부품 STEP 18개로 **78개 배치·176개 솔리드 → 56개 조립 단위 → 고정품 제외 55단계 전체 검토 순서** 생성을 최종 패키지에서 확인했습니다.
 
-## 저장·팀원 간 전달
+**이 실제 제품의 전체 조립성 검증은 `BLOCKED`입니다.** 원본 최종 배치의 겹침, 6개 배치의 표현 검사 차이와 시간 내 판정하지 못한 경로가 남아 있습니다. 검토 순서 생성과 물리적 조립 검증 통과를 구분하며 미통과 순서의 공식 확정은 차단합니다. 최적 순서의 보장도 제공하지 않습니다.
 
-자료는 각 사용자의 **%LOCALAPPDATA%\PILOT Studio\data**에 저장됩니다. Windows 탐색기 주소창에 이 경로를 입력하면 확인할 수 있습니다. DB는 앱 전용 MariaDB이며 기존 MariaDB 서비스나 DB를 사용하지 않습니다.
+현재는 최종 자세를 유지한 축 방향 직선 이동을 검사합니다. 회전·경유점 경로, 공구 접근, 탄성 변형 해석은 범위에 포함하지 않습니다. 상세 공정 편집, 자유로운 템플릿 필드 배치, 과거 확정본 선택 재출력 UI, 전체 계획의 휴리스틱/ML 자동 비교 등 잔여 항목은 [보고서](docs/PILOT_2.0.5_구현검증_보고서.md)와 [설계서 §0.0](docs/PILOT_구현설계_v0.6.md)에 명시했습니다.
 
-- 팀원 간 프로젝트가 자동으로 동기화되지는 않습니다.
-- 프로젝트 전달·보관에는 프로그램의 **저장소·환경 → 백업** 기능을 사용합니다. 전달받은 사용자는 복원 기능으로 새 저장소를 만들고 자료를 확인합니다. 다른 PC에서의 복원은 별도 확인이 필요합니다.
-- 실행 중인 DB 폴더를 직접 복사하거나 원본 CAD·DB·캐시를 임의로 삭제하지 마세요.
-- 업데이트 전에는 프로젝트를 백업하고 새 설치본은 Releases에서 확인하세요.
+회귀 시험 **49개**, 합성 STEP의 등록→PASS→확정→MP4→수정→재검증, 영상 출력 후 설치 자원 무결성, 실제 Electron 3D 재생 후 두 차례 재시작, 독립 시험 폴더의 2.0.2→2.0.5 업데이트·데이터 보존을 확인했습니다. 별도 신규 PC 인수와 실제 작업자 필드테스트는 남아 있습니다.
 
-## 문제가 생겼을 때
+![실제 정션박스 55단계 검토 화면](docs/media/hvjb-v2.0.5.png)
 
-담당자에게 **앱/배포 버전, Windows 버전, 입력 방식·CAD 파일명, 실패 단계, 오류 코드·화면과 해당 작업 로그**를 전달합니다. [팀원 안내](docs/TEAM_SETUP.md)에 로그 위치와 상세 절차가 있습니다. 공유가 허용된 자료만 전달하세요.
+회사 원본 CAD, 프로젝트 DB와 원본 CAD가 포함된 검토 백업은 이 공개 저장소 및 Release에 포함하지 않았습니다. 필요한 STEP은 팀 내 제공 자료로 등록하세요. 제공 영상의 참고 이미지는 회사의 최종 승인 양식으로 간주하지 않으며 공식 출력 전에 양식을 검토해야 합니다.
 
-시간 초과·전처리 실패를 전체 순서 성공으로 해석하지 않습니다. 실패한 부품을 제거하거나 검사 실패를 숨겨 계획을 확정하지 마세요.
+## 업데이트와 데이터
 
-## 개발자: 소스와 빌드
+새 버전이 나오면 [Releases](https://github.com/gyuwon-k/15-thn_project/releases/latest)의 설치 파일을 실행합니다. 앱을 종료하고 업데이트한 뒤 **저장소·환경**에서 실제 버전을 확인하세요.
 
-이 저장소는 **소스·설계 문서·시험 코드·의존성 lockfile·빌드 설정**을 관리합니다. 기업 CAD·Assembly Flow, 사용자 프로젝트·DB·인증값, 시험 데이터·로그, 가중치·네이티브 런타임과 EXE는 소스 트리에 포함하지 않습니다. 설치파일은 Releases의 별도 배포 자산입니다.
+동일 세대 앱은 새 릴리스를 별도 폴더에 준비하고 사전 검사 후 활성 버전을 전환합니다. 실패한 새 릴리스로 기존 정상 버전을 바꾸지 않습니다. 프로젝트 데이터는 기본적으로 `%LOCALAPPDATA%\PILOT Studio\data-v2`에 보관하며 설치 폴더와 분리됩니다. 업데이트 전 앱에서 백업하세요.
 
-소스를 수정하거나 빌드하려면 [개발 환경 준비 안내](docs/REPOSITORY_SETUP.md)를 확인하세요. 설치본 실행과 달리 Python 3.12 개발 환경, 프런트엔드 빌드 도구, 별도 Python 3.11 ASAP 환경·공식 가중치·검증된 RedMax, MariaDB·영상 런타임이 필요합니다. 재빌드 스크립트의 로컬 경로와 구성 요소도 새 PC에서 준비해야 합니다.
+**기존 1.x DB를 2.x로 자동 변환하지 않습니다.** 기존 운영 자료는 별도로 백업·보존하고 2.x에서 STEP을 등록해 새 프로젝트로 검증하세요. 저장소 복원은 별도 저장소를 검증해 전환하는 방식이며 프로젝트 병합 기능은 아닙니다.
 
-- **backend/**: 프로젝트·공정·검증·저장·영상 API
-- **asap_service/**: CAD·매칭·조립단위·전처리·ASAP 어댑터
-- **frontend/**: React/Three.js 화면과 실제 행렬 경로 재생
-- **desktop/**: Windows 독립 창과 앱 수명 관리
-- **packaging/, scripts/**: 런타임·EXE·설치파일 빌드와 검증
-- **tests/**: 시험 코드. 외부 CAD·런타임이 필요한 통합 시험은 따로 준비합니다.
+영상 브라우저는 사용자 데이터에 준비한 빌드별 검증 사본으로 실행해 설치 파일을 변경하지 않습니다. 재사용 시 파일 해시를 다시 확인합니다.
 
-## 설계·검증 문서
+## 개발자가 소스 실행하기
 
-- [최종통합 설계서 v1.6](docs/PILOT_인터페이스_최종통합본_ASAP반영.md)
-- [ASAP 구현설계 v0.4](docs/ASAP_SPEC.md)
-- [구현·검증 상태](docs/IMPLEMENTATION_STATUS.md)
-- [저장소 구현](docs/DESKTOP_STORAGE.md)
-- [외부 구성 요소 고지](docs/THIRD_PARTY_NOTICES.md)
+일반 사용자는 위 설치 파일을 사용하세요. 아래는 소스 수정·빌드용입니다. Windows x64, **Python 3.12**, Node.js/npm과 Inno Setup 6이 필요합니다. 저장소 루트에서 실행합니다.
 
-## 설치파일 확인 값
+```powershell
+git clone https://github.com/gyuwon-k/15-thn_project.git
+cd 15-thn_project
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+.venv\Scripts\python.exe -m pip install -r requirements-test.txt
+npm --prefix frontend ci
+npm --prefix desktop ci
+$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'work\playwright-cache'
+.venv\Scripts\python.exe -m playwright install chromium
+```
 
-파일: **PILOT-Studio-Setup-1.0.0.exe** · 크기: **1,201,627,589 bytes**
+MariaDB **12.3.2 Windows x64 ZIP 배포본**을 [공식 다운로드](https://mariadb.org/download/)에서 받아 압축을 풉니다. 아래 `<MariaDB압축해제폴더>`를 해당 폴더로 바꿉니다. 시스템 DB 서비스 설치 대신 앱 전용 인스턴스를 실행합니다.
 
-SHA-256: `3c177bf8dab2db0506487bc2c3a91975faf9e72663e89fbe2e45fec7ac1faad2`
+```powershell
+.venv\Scripts\python.exe scripts/stage_runtime.py --mariadb '<MariaDB압축해제폴더>' --browsers $env:PLAYWRIGHT_BROWSERS_PATH
+$env:PILOT_PYTHON = (Resolve-Path .venv\Scripts\python.exe).Path
+$env:PILOT_RESOURCE_DIR = (Resolve-Path packaging\resources).Path
+$env:PLAYWRIGHT_BROWSERS_PATH = (Resolve-Path packaging\resources\browsers).Path
+$env:PILOT_DATA_DIR = Join-Path $PWD 'work\dev-data'
+npm --prefix frontend run build
+npm --prefix desktop start
+```
+
+버전은 `release.json`, Python 및 npm 의존성은 lock 파일을 기준으로 합니다. 소스 ZIP은 런타임 바이너리와 개발환경을 포함하지 않습니다.
+
+## 시험과 설치 패키지 빌드
+
+런타임 준비 후 회귀 시험을 실행합니다. 시험 DB·자료는 `work/`에 생성합니다.
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Inno Setup을 설치하고 아래 경로를 실제 `ISCC.exe` 위치로 바꿉니다. Windows 경로 길이를 줄이기 위해 소스는 짧은 폴더에 두는 편이 좋습니다.
+
+```powershell
+.venv\Scripts\python.exe scripts/build_release.py --python .venv/Scripts/python.exe --inno '<InnoSetup폴더>/ISCC.exe' --skip-stage
+```
+
+생성 파일은 `dist/PILOT-Studio-Setup-<버전>.exe`입니다. 릴리스 배포명은 `PILOT-Studio-<버전>-Setup.exe`로 통일합니다. 새 코드를 배포할 때 `release.json`의 앱 버전·고유 build ID·구성 요소 ID와 변경된 알고리즘 버전을 갱신합니다. 이미 완성된 동일 build ID를 덮어쓰지 않습니다. UI·백엔드·런처 ID와 파일 해시가 일치해야 활성화됩니다.
+
+## 저장소 구성
+
+- `backend/`: STEP 전처리·매칭·경로 검사·추천·업무 API·DB·영상·학습
+- `frontend/`: React·TypeScript·Three.js 작업 화면
+- `desktop/`, `launcher.py`: 데스크톱과 버전 실행 연결
+- `packaging/`, `scripts/`: 런타임 준비·설치 빌드·실행 검증
+- `tests/`: 회귀·DB 통합 시험
+- `docs/`: 구현설계 v0.6, 사용 안내, 실제 검증 결과와 화면
+
+[서드파티 고지](THIRD_PARTY_NOTICES.md)를 확인하고 재배포 시 동봉된 라이선스를 유지하세요.

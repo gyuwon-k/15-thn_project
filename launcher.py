@@ -1,35 +1,87 @@
-"""One executable entrypoint: native desktop by default, isolated workers by flag."""
+"""Frozen backend/worker entry point; desktop shell is Electron."""
 from multiprocessing import freeze_support
+import json
 import os
+from pathlib import Path
 import sys
+
 
 def main():
     freeze_support()
-    os.environ.setdefault('PYTHONUTF8', '1')
-    if getattr(sys, 'frozen', False) and (sys.stdout is None or sys.stderr is None):
-        from pathlib import Path
-        data=Path(os.environ.get('PILOT_DATA_DIR',str(Path(os.environ.get('LOCALAPPDATA',Path.home()))/'PILOT Studio'/'data')))
-        folder=data/'logs';folder.mkdir(parents=True,exist_ok=True)
-        stream=(folder/('process-'+str(os.getpid())+'.log')).open('a',encoding='utf-8',buffering=1)
-        sys.stdout=sys.stdout or stream;sys.stderr=sys.stderr or stream
-        sys.__stdout__=sys.__stdout__ or stream;sys.__stderr__=sys.__stderr__ or stream
-    if len(sys.argv) == 3 and sys.argv[1] == '--worker':
-        from backend.worker import run_worker
-        run_worker(sys.argv[2])
-    elif '--asap-worker' in sys.argv:
-        sys.argv.remove('--asap-worker')
-        from asap_service.backend.worker import main as run_worker
-        run_worker()
-    elif len(sys.argv) == 4 and sys.argv[1] == '--restore-worker':
-        from backend.desktop_storage import restore_worker
-        restore_worker(sys.argv[2], sys.argv[3])
-    elif '--no-browser' in sys.argv or '--server' in sys.argv:
-        if '--server' in sys.argv: sys.argv.remove('--server')
+    os.environ.setdefault("PYTHONUTF8", "1")
+    from backend.release import default_data_dir, runtime_identity, resource_root
+    if getattr(sys, "frozen", False):
+        browser_log_dir = default_data_dir() / "logs"
+        if "--identity" not in sys.argv:
+            browser_log_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["CHROME_LOG_FILE"] = str(browser_log_dir / "chromium.log")
+        os.environ.setdefault("PILOT_RESOURCE_DIR", str(resource_root()))
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(resource_root() / "browsers"))
+        encoders = list((resource_root() / "ffmpeg").glob("*.exe"))
+        if encoders:
+            os.environ.setdefault("IMAGEIO_FFMPEG_EXE", str(encoders[0]))
+        if sys.stdout is None or sys.stderr is None:
+            folder = browser_log_dir
+            folder.mkdir(parents=True, exist_ok=True)
+            stream = (folder / ("backend-" + str(os.getpid()) + ".log")).open("a", encoding="utf-8", buffering=1)
+            sys.stdout = sys.stdout or stream
+            sys.stderr = sys.stderr or stream
+    manifest = runtime_identity()
+    if "--prepare-update" in sys.argv:
+        from backend.storage import Storage, atomic_json
+        result_path = Path(sys.argv[sys.argv.index("--prepare-update") + 1])
+        storage = Storage(default_data_dir())
+        try:
+            storage.init()
+            backup = storage.backup() if storage.list_projects() else None
+            import OCP
+            from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+            if BRepPrimAPI_MakeBox(1.0, 1.0, 1.0).Shape().IsNull():
+                raise RuntimeError("GEOMETRY_RUNTIME_UNAVAILABLE")
+            import numpy
+            import imageio_ffmpeg
+            import subprocess
+            subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-version"], check=True, capture_output=True, timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            from backend.main import create_app
+            frontend = Path(os.environ.get("PILOT_RELEASE_ROOT", resource_root())) / "frontend" / "build-info.json"
+            if frontend.is_file() and json.loads(frontend.read_text(encoding="utf-8")).get("build_id") != manifest["build_id"]:
+                raise RuntimeError("FRONTEND_BUILD_MISMATCH")
+            atomic_json(result_path, {"status": "ready", "build_id": manifest["build_id"], "schema_version": storage.status()["schema_version"], "backup_id": backup["id"] if backup else None})
+        finally:
+            storage.close()
+    elif "--identity" in sys.argv:
+        print(json.dumps(manifest, ensure_ascii=False))
+    elif "--server" in sys.argv:
         from backend.main import run
+        parent = os.environ.get("PILOT_PARENT_PID")
+        if parent:
+            import psutil
+            import threading
+            import time
+            try:
+                identity = psutil.Process(int(parent)).create_time()
+            except psutil.Error:
+                raise RuntimeError("DESKTOP_PARENT_MISSING")
+            def watch_parent():
+                while True:
+                    time.sleep(1.0)
+                    try:
+                        alive = psutil.Process(int(parent)).create_time() == identity
+                    except psutil.Error:
+                        alive = False
+                    if not alive:
+                        from backend import main as api
+                        if api.SERVER is not None:
+                            api.SERVER.should_exit = True
+                        return
+            threading.Thread(target=watch_parent, daemon=True).start()
         run()
+    elif "--worker" in sys.argv:
+        from backend.worker import run_worker
+        raise SystemExit(run_worker(sys.argv[sys.argv.index("--worker") + 1]))
     else:
-        from desktop.shell import run
-        run()
+        raise SystemExit("Start PILOT-Studio.exe to open the desktop application.")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
