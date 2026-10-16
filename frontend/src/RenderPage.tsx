@@ -17,7 +17,7 @@ export default function RenderPage({id}:{id:string}){
   const controller={ready:false,duration,error,scene_ready:ready,setTime:async(value:number)=>{
    if(!Number.isFinite(value)||value<0||value>duration+.01)throw new Error('영상 시간 범위를 벗어났습니다.');
    if(steps.some(item=>!isExecutableStep(item)))throw new Error('검증 경로가 없는 단계는 영상으로 재생할 수 없습니다.');
-   flushSync(()=>setTime(Math.min(value,duration)));await document.fonts.ready;await afterPaint();
+   flushSync(()=>setTime(Math.min(value,duration)));await document.fonts.ready;
    root.current?.querySelectorAll<HTMLElement>('[data-fit]').forEach(element=>{const base=Number(element.dataset.font)||18;element.style.fontSize=base+'px';let size=base;while((element.scrollHeight>element.clientHeight+1||element.scrollWidth>element.clientWidth+1)&&size>10){size-=.5;element.style.fontSize=size+'px';}if(element.scrollHeight>element.clientHeight+2||element.scrollWidth>element.clientWidth+2)throw new Error('영상 정보가 템플릿 영역을 초과합니다. 주의사항을 나누거나 템플릿 영역을 조정해 주세요.');});
    await afterPaint();return {time:Math.min(value,duration),step_id:stageAt(steps,value)?.step.id};
   }};

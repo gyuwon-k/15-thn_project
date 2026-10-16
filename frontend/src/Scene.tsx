@@ -1,4 +1,4 @@
-import {useEffect,useRef,useState} from 'react';
+import {useEffect,useLayoutEffect,useRef,useState} from 'react';
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 import {Box,Focus,RotateCcw,Layers3,Eye,LoaderCircle,Camera} from 'lucide-react';
@@ -15,7 +15,7 @@ export default function Scene(props:Props){
  useEffect(()=>{
   if(!host.current)return;let alive=true;
   let renderer:THREE.WebGLRenderer;
-  try{renderer=new THREE.WebGLRenderer({antialias:true,preserveDrawingBuffer:true});}catch{setError('3D 그래픽을 초기화하지 못했습니다. 그래픽 드라이버를 확인해 주세요.');return;}
+  try{renderer=new THREE.WebGLRenderer({antialias:true,preserveDrawingBuffer:true,powerPreference:'high-performance'});}catch{setError('3D 그래픽을 초기화하지 못했습니다. 그래픽 드라이버를 확인해 주세요.');return;}
   renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=.9;renderer.setSize(host.current.clientWidth,host.current.clientHeight);host.current.appendChild(renderer.domElement);
   const scene=new THREE.Scene();scene.background=new THREE.Color(props.render?'#e8eef0':'#E5E5E7');
   const camera=new THREE.PerspectiveCamera(35,1,.00001,100);camera.position.set(.7,.55,.75);
@@ -26,7 +26,7 @@ export default function Scene(props:Props){
   const entryVisual=new THREE.Group();scene.add(entryVisual);
   const e={entryVisual,scene,renderer,camera,controls,model,grid,selection,meshes:[] as THREE.Mesh[],radius:.3,center:new THREE.Vector3(),explode:false,isolate:false,ready:false};engine.current=e;
   const resize=()=>{if(!host.current)return;const width=Math.max(1,host.current.clientWidth),height=Math.max(1,host.current.clientHeight);renderer.setSize(width,height);camera.aspect=width/height;camera.updateProjectionMatrix();renderer.render(scene,camera);};const observer=new ResizeObserver(resize);observer.observe(host.current);resize();
-  let frame=0;const draw=()=>{if(!alive)return;frame=requestAnimationFrame(draw);controls.update();renderer.render(scene,camera);};draw();
+  let frame=0;const draw=()=>{if(!alive)return;frame=requestAnimationFrame(draw);controls.update();renderer.render(scene,camera);};if(!props.render)draw();
   let down=[0,0];const pointerDown=(event:PointerEvent)=>{down=[event.clientX,event.clientY];};
   const pointerUp=(event:PointerEvent)=>{if(Math.hypot(event.clientX-down[0],event.clientY-down[1])>5)return;const rect=renderer.domElement.getBoundingClientRect(),pointer=new THREE.Vector2((event.clientX-rect.left)/rect.width*2-1,-(event.clientY-rect.top)/rect.height*2+1),ray=new THREE.Raycaster();ray.setFromCamera(pointer,camera);const hit=ray.intersectObjects(e.meshes).find(item=>item.object.visible);if(hit)latest.current.onSelect?.(hit.object.userData.occurrenceId,event.ctrlKey||event.metaKey);};
   renderer.domElement.addEventListener('pointerdown',pointerDown);renderer.domElement.addEventListener('pointerup',pointerUp);
@@ -52,7 +52,7 @@ export default function Scene(props:Props){
   }).catch(err=>{if(!dead){setError(err.message);setLoading(false);props.onReady?.(false);}});
   return()=>{dead=true;};
  },[props.url]);
- useEffect(()=>{const e=engine.current;if(e){e.explode=exploded;e.isolate=isolated;updateScene(e,props);e.renderer.render(e.scene,e.camera);}},[props.entryHint,props.time,props.selected,props.selectedIds,props.hiddenIds,props.units,props.steps,props.camera,props.autoCamera,exploded,isolated]);
+ useLayoutEffect(()=>{const e=engine.current;if(e){e.explode=exploded;e.isolate=isolated;updateScene(e,props);e.renderer.render(e.scene,e.camera);}},[props.entryHint,props.time,props.selected,props.selectedIds,props.hiddenIds,props.units,props.steps,props.camera,props.autoCamera,exploded,isolated]);
  function fit(selected=false){const e=engine.current;if(!e)return;if(selected&&e.selection.visible){const center=e.selection.box.getCenter(new THREE.Vector3()),size=e.selection.box.getSize(new THREE.Vector3()).length();e.controls.target.copy(center);e.camera.position.copy(center).add(new THREE.Vector3(size*1.3,size,size*1.3));e.controls.update();}else fitCamera(e);}
  function saveCamera(){const e=engine.current;if(e)props.onCameraSave?.({position:e.camera.position.toArray(),target:e.controls.target.toArray(),coordinate_system:'viewer_m'});}
  return <div className={'scene '+(props.render?'render-scene':'')}><div className="scene-canvas" ref={host}/>{!props.render&&<><div className="viewport-label"><i/> LIVE 3D <span>{count?`${count} 배치`:'모델 뷰어'}</span></div><div className="viewport-tools"><button title="전체 보기" aria-label="전체 보기" onClick={()=>fit()}><Focus size={17}/></button><button title="선택 중심 보기" aria-label="선택 중심 보기" onClick={()=>fit(true)} disabled={!props.selected}><Box size={17}/></button><button title="분해 보기" aria-label="분해 보기" className={exploded?'active':''} onClick={()=>setExploded(!exploded)}><Layers3 size={17}/></button><button title="선택 부품만 보기" aria-label="선택 부품만 보기" className={isolated?'active':''} disabled={!props.selected} onClick={()=>setIsolated(!isolated)}><Eye size={17}/></button>{props.onCameraSave&&<button title="이 시점을 출력 카메라로 저장" aria-label="출력 카메라 저장" onClick={saveCamera}><Camera size={17}/></button>}<button title="표시 초기화" aria-label="표시 초기화" onClick={()=>{setExploded(false);setIsolated(false);fit();}}><RotateCcw size={17}/></button></div><div className="axis-widget"><span className="axis-z">Z</span><span className="axis-x">X</span><span className="axis-y">Y</span></div><div className="viewport-hint">드래그 회전 · 스크롤 확대 · Ctrl+클릭 다중 선택</div></>}{loading&&<div className="scene-state"><LoaderCircle className="spin" size={28}/><strong>CAD 형상을 불러오는 중</strong><span>모델의 실제 배치와 표시 형상을 준비합니다.</span></div>}{!loading&&!count&&<div className="scene-state"><Box size={42}/><strong>{error||'완제품 STEP을 등록하세요'}</strong><span>{error?'모델 검증 결과에서 원인을 확인할 수 있습니다.':'등록된 제품의 실제 3D 모델이 이곳에 표시됩니다.'}</span></div>}</div>;

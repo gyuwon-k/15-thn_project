@@ -536,7 +536,9 @@ def create_app(data_dir=None,resources=None):
         if playback["executable_prefix_count"]!=playback["total_count"] or proof.get("dependency_hash")!=domain.geometry_hash(state) or proof.get("build_id")!=svc.release["build_id"]:
             raise DomainError("VERIFIED_PATHS_REQUIRED","모든 단계의 경로를 현재 버전으로 검증한 후 영상을 생성해 주세요. 보류된 단계는 영상으로 재생할 수 없습니다.")
         if "seconds_per_step" in body:raise DomainError("STEP_TIMING_REQUIRED","영상 시간은 순서 단계의 재생 시간으로 저장한 뒤 확정해 주세요.")
-        settings={"width":int(body.get("width",1280)),"height":int(body.get("height",720)),"fps":int(body.get("fps",24))}
+        acceleration=body.get('video_acceleration','auto')
+        if acceleration not in ('auto','cpu'):raise DomainError('RENDER_SETTINGS','영상 가속 방식은 auto 또는 cpu여야 합니다.')
+        settings={"width":int(body.get("width",1280)),"height":int(body.get("height",720)),"fps":int(body.get("fps",24)),"video_acceleration":acceleration}
         if (settings["width"],settings["height"]) not in ((640,360),(1280,720),(1920,1080)) or settings["fps"] not in (12,24,30):
             raise DomainError("RENDER_SETTINGS","지원하는 영상 크기·프레임·단계 시간을 선택해 주세요.")
         render_id=uid("render-")

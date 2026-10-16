@@ -1,0 +1,193 @@
+{
+  "app_version": "2.4.1",
+  "spec_version": "0.12",
+  "build_id": "pilot-2.4.1-20261016T014154Z",
+  "tests": {
+    "python_suite": {
+      "passed": 205,
+      "seconds": 101.401
+    },
+    "typescript_build": "PASS",
+    "native_ui": {
+      "status": "PASS",
+      "checks": [
+        "Native STEP → reverse generation → full revalidation → confirmation → MP4 → manual edit/revalidation",
+        "Actual UI confirms validated sequence with empty torque/caution, unchecked work review and no recorder",
+        "Unit allowed/preferred directions saved through actual UI and invalidated proof",
+        "Design2 layout / 1440, 980, 600 px without page horizontal overflow",
+        "Generation and full revalidation show 30 minutes each; candidate/native limits show 120 seconds",
+        "Incomplete removal preserves existing steps, work information and validation",
+        "Incomplete trace stored and downloaded with exact SHA/count",
+        "Failed candidate highlights moving/blocking units with a static entry arrow; no uncertified animation",
+        "Unvalidated plan cannot be confirmed"
+      ],
+      "javascript_errors": []
+    }
+  },
+  "performance": {
+    "fixture": "synthetic_three_parts",
+    "width": 1280,
+    "height": 720,
+    "fps": 24,
+    "frames": 144,
+    "video_seconds": 6,
+    "baseline_version": "2.4.0",
+    "baseline_seconds": 32.811729499997455,
+    "new_seconds": 15.1594,
+    "speedup": 2.1644477683811667,
+    "gpu_and_frame_pipeline_improvements_combined": true,
+    "cold_browser_setup_in_comparison": false,
+    "baseline_scope": "Same render definition/content: frozen 2.4.0 frontend and old headless-shell SwiftShader/libx264 exporter versus new frontend, hardware Chromium, auto encoder and lossless capture.",
+    "sample_frame_comparison": [
+      {
+        "frame": 0,
+        "mean_absolute_rgb_difference": 0.21643012152777777
+      },
+      {
+        "frame": 72,
+        "mean_absolute_rgb_difference": 0.2297605613425926
+      },
+      {
+        "frame": 143,
+        "mean_absolute_rgb_difference": 0.2361917679398148
+      }
+    ],
+    "encoded_frame_comparison": {
+      "frame": 72,
+      "mean_absolute_rgb_difference": 0.8907005931712962,
+      "decoded_size": [
+        1280,
+        720
+      ],
+      "status": "PASS"
+    },
+    "graphics": {
+      "browser_fallback": null,
+      "browser_mode": "chromium",
+      "hardware": true,
+      "renderer": "ANGLE (Intel, Intel(R) Arc(TM) 140T GPU (16GB) (0x00007D51) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+      "vendor": "Google Inc. (Intel)"
+    },
+    "encoding": {
+      "codec": "h264_nvenc",
+      "fallbacks": [],
+      "hardware": true,
+      "mode": "auto",
+      "probes": [
+        {
+          "available": true,
+          "codec": "h264_nvenc",
+          "reason": null
+        }
+      ],
+      "provider": "NVIDIA NVENC"
+    },
+    "timings": {
+      "browser_runtime_seconds": 3.3725,
+      "decode_seconds": 0.1727,
+      "encoder_finish_seconds": 0.1499,
+      "encoder_pipe_seconds": 0.983,
+      "encoder_probe_seconds": 2.8846,
+      "frame_capture_seconds": 4.655,
+      "frame_update_seconds": 1.1122,
+      "scene_ready_seconds": 1.7272,
+      "total_seconds": 15.1594
+    }
+  },
+  "native_gpu": {
+    "status": "PASS",
+    "build_id": "pilot-2.4.1-20261016T014154Z",
+    "frames": 144,
+    "decoded_frames": 144,
+    "graphics": {
+      "browser_fallback": null,
+      "browser_mode": "chromium",
+      "hardware": true,
+      "renderer": "ANGLE (Intel, Intel(R) Arc(TM) 140T GPU (16GB) (0x00007D51) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+      "vendor": "Google Inc. (Intel)"
+    },
+    "encoding": {
+      "codec": "h264_nvenc",
+      "fallbacks": [],
+      "hardware": true,
+      "mode": "auto",
+      "probes": [
+        {
+          "available": true,
+          "codec": "h264_nvenc",
+          "reason": null
+        }
+      ],
+      "provider": "NVIDIA NVENC"
+    },
+    "capture_method": "lossless_png_committed_frame"
+  },
+  "forced_gpu_failure": {
+    "status": "PASS",
+    "encoding": {
+      "codec": "libx264",
+      "provider": "CPU",
+      "hardware": false,
+      "mode": "auto",
+      "probes": [],
+      "fallbacks": [
+        {
+          "codec": "h264_nvenc",
+          "reason": "영상 인코더 연결이 종료되었습니다."
+        }
+      ]
+    },
+    "decoded_frames": 144
+  },
+  "native_update": {
+    "status": "passed",
+    "previous_build_id": "pilot-2.4.0-20261016T000015Z",
+    "new_build_id": "pilot-2.4.1-20261016T014154Z",
+    "old_pointer": {
+      "app_version": "2.4.0",
+      "build_id": "pilot-2.4.0-20261016T000015Z",
+      "format": "pilot-active-release/2",
+      "release_id": "pilot-2.4.0-20261016T000015Z"
+    },
+    "new_pointer": {
+      "app_version": "2.4.1",
+      "build_id": "pilot-2.4.1-20261016T014154Z",
+      "format": "pilot-active-release/2",
+      "release_id": "pilot-2.4.1-20261016T014154Z"
+    },
+    "preserved_project_id": "project-664f2feacaa24c4083900848a32ece03",
+    "preserved_row_version": 2,
+    "previous_backup_id": "backup-95e4c411837643789b642eac4b75fe60",
+    "backup_count": 2,
+    "failed_update_preserved_active_release": true,
+    "failed_update_preserved_data": true,
+    "old_model_requires_reprocessing": false,
+    "managed_original_reprocessed_by_new_version": true,
+    "previous_model_archived": true,
+    "scope": "native launcher/backend activation; isolated directory, no installer registration changes"
+  },
+  "current_pc_installation": {
+    "status": "deferred",
+    "reason": "Existing user STEP import/matching is running; application was preserved after installer reported files in use.",
+    "installer_attempt_exit_code": 5,
+    "active_build_id": "pilot-2.4.0-20261016T000015Z",
+    "user_action": "Finish the running job, close PILOT Studio, then install the 2.4.1 Setup."
+  },
+  "source_freeze_verified_files": 104,
+  "unchanged_geometry_and_planning_modules": {
+    "geometry.py": true,
+    "geometry_matching.py": true,
+    "representation_repair.py": true,
+    "exact_extrema.py": true,
+    "planning.py": true,
+    "disassembly.py": true,
+    "support.py": true,
+    "process_rules.py": true
+  },
+  "installer": {
+    "name": "PILOT-Studio-2.4.1-Setup.exe",
+    "bytes": 742095786,
+    "sha256": "88c101707f09f7cfc5a67bebb710d20236528b062dd2a585a6bdf3052a1f6267"
+  },
+  "scope": "Video pipeline update. Company complete sequence limitation from 2.4.0 remains; no new company whole-sequence claim."
+}
