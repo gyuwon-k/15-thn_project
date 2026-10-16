@@ -68,7 +68,8 @@ def build_dataset(histories):
         state=history.get("project") or history.get("snapshot") or history
         key=history.get("source_hash") or digest(state)
         reason=None
-        if key in seen:reason="duplicate_confirmation"
+        if state.get('plan',{}).get('learning_eligibility',{}).get('eligible') is False:reason=state['plan']['learning_eligibility']['reason']
+        elif key in seen:reason="duplicate_confirmation"
         elif history.get("status")!="CONFIRMED":reason="not_confirmed"
         elif state.get("validation",{}).get("status")!="PASS":reason="not_validated"
         elif not history.get("expert_preference_reviewed"):reason="expert_preference_not_reviewed"

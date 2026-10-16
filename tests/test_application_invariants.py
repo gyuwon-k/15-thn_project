@@ -30,16 +30,60 @@ def fixture():
                  {"id":"u-b","occurrence_ids":["b"],"bbox":{"min":[4,0,0],"max":[5,1,1]}}]}
     p["rules"]["fixed_unit_ids"]=["u-a"]
     p["plan"]["steps"]=[{"id":"s-b","unit_id":"u-b","direction":"-Z","distance_mm":20,"reviewed":True,"torque_status":"not_applicable","caution_reviewed":True,"path":{"kind":"translation","start_translation_mm":[0,0,20],"end_translation_mm":[0,0,0],"verified":True}}]
+    p["plan"]["steps"][0].update(status="PASS",executable=True,planning_state="READY")
+    p["plan"]["steps"][0]["path"]["executable"]=True
     p["validation"]={"status":"PASS","dependency_hash":domain.geometry_hash(p)}
     return p
 
 
 class ApplicationInvariantTests(unittest.TestCase):
-    def test_empty_caution_requires_explicit_none_review(self):
-        p=fixture();p["plan"]["steps"][0]["caution_reviewed"]=False
-        self.assertTrue(any("주의사항" in reason for reason in domain.confirmation_errors(p)))
-        p["plan"]["steps"][0]["caution"]="실제 공정 주의사항"
+    def test_rename_does_not_clear_failed_part_import_or_missing_matching_proof(self):
+        p=fixture();model=p["model"]
+        model["diagnostics"]=[{"code":"PART_IMPORT_FAILED"}]
+        model["quality"].update(inventory_complete=True,display_ready=True,collision_ready=True)
+        for u in model["units"]:u["matching"]={"geometry_verification":{"status":"NOT_APPLICABLE"},"review_required":False}
+        domain.refresh_matching_quality(model)
+        self.assertFalse(model["quality"]["matching_ready"])
+        self.assertEqual(model["quality"]["status"],"LIMITED")
+        model["diagnostics"]=[];model["units"][0]["matching"]={"review_required":False}
+        domain.refresh_matching_quality(model)
+        self.assertFalse(model["quality"]["matching_ready"])
+        model["diagnostics"]=[{"code":"MATCH_SEARCH_LIMITED"}]
+        for u in model["units"]:u["matching"]={"method":"CAD leaf fallback","geometry_verification":{"status":"NOT_APPLICABLE"},"review_required":False}
+        domain.refresh_matching_quality(model)
+        self.assertFalse(model["quality"]["matching_ready"])
+        for u in model["units"]:u["matching"]={"method":"manual_verified","geometry_verification":{"status":"PASS"},"review_required":False}
+        domain.refresh_matching_quality(model)
+        self.assertTrue(model["quality"]["matching_ready"])
+
+    def test_process_candidates_follow_mapping_names_and_fixed_units(self):
+        p=fixture();original=domain.process_profile_hash(p)
+        for edit in (lambda q:q["rules"].update(fixed_unit_ids=[]),lambda q:q["model"]["units"][0].update(name="changed")):
+            changed=copy.deepcopy(p);edit(changed)
+            self.assertNotEqual(domain.process_profile_hash(changed),original)
+        p["plan"]["steps"][0]["caution"]="Work information only"
+        self.assertEqual(domain.process_profile_hash(p),original)
+
+    def test_collision_scope_change_invalidates_previous_proof(self):
+        p=fixture()
+        changed=domain.patch_project(p,{"expected_revision":1,"rules":{"collision_policy":{"mode":"uncertainty_clearance"}}})
+        self.assertIsNone(changed["validation"])
+        self.assertIsNone(changed["plan"]["steps"][0]["path"])
+        with self.assertRaises(domain.DomainError):
+            domain.patch_project(p,{"expected_revision":1,"rules":{"collision_policy":{"mode":"skip_collision"}}})
+
+    def test_confirm_passed_plan_without_optional_work_information(self):
+        p=fixture();step=p["plan"]["steps"][0]
+        for key in ("reviewed","caution","caution_reviewed","torque","torque_status"):
+            step.pop(key,None)
+        before=copy.deepcopy(step)
         self.assertEqual(domain.confirmation_errors(p),[])
+        self.assertEqual(step,before)
+        step.update(reviewed=False,caution="",caution_reviewed=False,torque=None,torque_status="required")
+        self.assertEqual(domain.confirmation_errors(p),[])
+        self.assertFalse(step["reviewed"])
+        self.assertFalse(step["caution_reviewed"])
+        self.assertIsNone(step["torque"])
     def test_video_publication_does_not_unconfirm_unchanged_plan(self):
         p=fixture();signature=domain.confirmation_hash(p)
         p["revision"]+=1;p["exports"].append({"file_id":"video"});p["updated_at"]="later"
@@ -51,12 +95,20 @@ class ApplicationInvariantTests(unittest.TestCase):
         self.assertTrue(domain.confirmation_errors(p,{"build_id":"new","algorithm_version":"a1"}))
         self.assertEqual(domain.confirmation_errors(p,{"build_id":"old","algorithm_version":"a1"}),[])
 
-    def test_required_torque_accepts_unit_object_and_rejects_nonfinite_or_wrong_units(self):
-        p=fixture();step=p["plan"]["steps"][0];step["torque_status"]="required"
-        for value in ({"value":3,"unit":"N·m"},3):
-            step["torque"]=value;self.assertEqual(domain.confirmation_errors(p),[])
-        for value in ({"value":3,"unit":"lb·ft"},float("inf"),float("nan"),True,0,None):
-            step["torque"]=value;self.assertTrue(domain.confirmation_errors(p))
+    def test_optional_information_cannot_bypass_assembly_confirmation_checks(self):
+        for state in ("COLLISION","UNKNOWN","NOT_RUN"):
+            with self.subTest(state=state):
+                p=fixture();p["validation"]["status"]=state
+                self.assertTrue(domain.confirmation_errors(p))
+        p=fixture();p["plan"]["steps"][0]["path"]=None
+        p["validation"]["dependency_hash"]=domain.geometry_hash(p)
+        self.assertTrue(any("검증 경로" in reason for reason in domain.confirmation_errors(p)))
+        p=fixture();p["plan"]["steps"].append(copy.deepcopy(p["plan"]["steps"][0]))
+        p["validation"]["dependency_hash"]=domain.geometry_hash(p)
+        self.assertTrue(any("누락되거나 중복" in reason for reason in domain.confirmation_errors(p)))
+        p=fixture();p["plan"]["steps"]=[]
+        p["validation"]["dependency_hash"]=domain.geometry_hash(p)
+        self.assertTrue(any("누락되거나 중복" in reason for reason in domain.confirmation_errors(p)))
 
     def test_idempotency_key_cannot_reuse_different_work(self):
         service=JobService.__new__(JobService);service.lock=threading.RLock();service.stopping=False
@@ -74,12 +126,34 @@ class ApplicationInvariantTests(unittest.TestCase):
         steps=copy.deepcopy(p["plan"]["steps"]);steps[0]["direction"]="+X"
         edited=domain.patch_project(p,{"expected_revision":1,"plan":{"steps":steps}})
         self.assertIsNone(edited["validation"])
-        self.assertFalse(edited["plan"]["steps"][0]["path"]["verified"])
+        self.assertIsNone(edited["plan"]["steps"][0]["path"])
+        self.assertFalse(edited["plan"]["steps"][0]["executable"])
         self.assertTrue(domain.confirmation_errors(edited))
 
     def test_old_pass_fingerprint_cannot_confirm_modified_geometry(self):
         p=fixture();p["rules"]["directions"]=["+X"]
         self.assertTrue(any("변경" in item for item in domain.confirmation_errors(p)))
+
+    def test_client_cannot_forge_geometric_proof_or_playback_state(self):
+        p=fixture();p["plan"]["steps"][0].update(status="COLLISION",executable=False,planning_state="BLOCKED",path=None)
+        incoming=copy.deepcopy(fixture()["plan"]["steps"])
+        edited=domain.patch_project(p,{"expected_revision":1,"plan":{"steps":incoming}})
+        step=edited["plan"]["steps"][0]
+        self.assertEqual(step["status"],"COLLISION")
+        self.assertFalse(step["executable"])
+        self.assertIsNone(step["path"])
+        self.assertEqual(edited["plan"]["playback"]["executable_prefix_count"],0)
+
+    def test_work_information_edit_preserves_proven_motion(self):
+        p=fixture();incoming=copy.deepcopy(p["plan"]["steps"]);incoming[0]["caution"]="검토한 작업 주의사항"
+        edited=domain.patch_project(p,{"expected_revision":1,"plan":{"steps":incoming}})
+        self.assertTrue(domain.executable_step(edited["plan"]["steps"][0]))
+        self.assertEqual(edited["validation"],p["validation"])
+
+    def test_playback_stops_at_first_unverified_predecessor(self):
+        steps=[copy.deepcopy(fixture()["plan"]["steps"][0]) for _ in range(3)]
+        steps[1]["executable"]=False
+        self.assertEqual(domain.playback_summary(steps)["executable_prefix_count"],1)
 
     def test_part_number_preserves_leading_zero_and_label_does_not_invalidate_geometry(self):
         p=fixture();edited=domain.patch_project(p,{"expected_revision":1,"part_number":"00123"})

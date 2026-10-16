@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 import urllib.request
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -66,6 +67,7 @@ def main():
                 headers={"X-Pilot-Token": token, "Content-Type": "application/json"})
             with urllib.request.urlopen(request, timeout=30) as response:
                 return json.loads(response.read())
+        api.base_url=base;api.token=token
         deadline = time.monotonic() + 90
         try:
             while True:
@@ -94,6 +96,22 @@ def main():
     activate(previous["build_id"])
     with server(old) as (api, before_health):
         project = api("/projects", {"name": "업데이트 보존 검증", "part_number": "KEEP-00017", "vehicle": "시험 차종"})
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+        from OCP.STEPControl import STEPControl_Writer,STEPControl_AsIs
+        fixture=folder/"update-fixture.step";writer=STEPControl_Writer()
+        writer.Transfer(BRepPrimAPI_MakeBox(4,5,6).Shape(),STEPControl_AsIs);writer.Write(str(fixture))
+        with fixture.open("rb") as stream:
+            response=httpx.post(api.base_url+"/api/projects/"+project["id"]+"/import",headers={"X-Pilot-Token":api.token},data={"expected_revision":project["revision"]},files={"assembly":(fixture.name,stream)},timeout=180)
+            response.raise_for_status();job=response.json()
+        def wait_job(call,job):
+            deadline=time.monotonic()+300
+            while time.monotonic()<deadline:
+                value=call("/jobs/"+job["id"])
+                if value["status"]=="succeeded":return
+                if value["status"] in ("failed","interrupted","canceled"):raise RuntimeError(value)
+                time.sleep(.5)
+            raise TimeoutError("UPDATE_IMPORT_TIMEOUT")
+        wait_job(api,job);project=api("/projects/"+project["id"])
         backup_before = api("/backups", {})
     before_pointer = json.loads((installation / "active-release.json").read_text(encoding="utf-8"))
     activate(manifest["build_id"])
@@ -104,6 +122,17 @@ def main():
         backups = api("/settings")["backups"]
         assert any(backup["id"] == backup_before["id"] for backup in backups)
         assert len(backups) >= 2, "Update preflight must back up existing projects"
+        reprocess_required=any(previous.get(key)!=manifest.get(key) for key in ('preprocess_version','matching_version','geometry_backend_version'))
+        assert preserved["model_reprocess_required"] is reprocess_required
+        if reprocess_required:
+            response=httpx.post(api.base_url+"/api/projects/"+project["id"]+"/generate",headers={"X-Pilot-Token":api.token},json={"expected_revision":preserved["revision"]})
+            assert response.status_code==422 and response.json()["code"]=="MODEL_REPROCESS_REQUIRED"
+        wait_job(api,api("/projects/"+project["id"]+"/reprocess",{"expected_revision":preserved["revision"]}))
+        reprocessed=api("/projects/"+project["id"])
+        assert not reprocessed["model_reprocess_required"]
+        assert reprocessed["model"]["source"]["sha256"]==project["model"]["source"]["sha256"]
+        assert reprocessed["model"]["processing_versions"]["preprocess_version"]==manifest["preprocess_version"]
+        assert any(e.get("kind")=="model_replaced" for e in api("/projects/"+project["id"]+"/history")["events"])
     failed_id = "pilot-invalid-update-fixture"
     failed = installation / "releases" / failed_id
     (failed / "backend").mkdir(parents=True)
@@ -122,6 +151,7 @@ def main():
         "old_pointer": before_pointer, "new_pointer": json.loads(pointer_before_failure), "preserved_project_id": project["id"],
         "preserved_row_version": preserved["row_version"], "previous_backup_id": backup_before["id"], "backup_count": len(backups),
         "failed_update_preserved_active_release": True, "failed_update_preserved_data": True, "test_directory": str(folder),
+        "old_model_requires_reprocessing":reprocess_required,"managed_original_reprocessed_by_new_version":True,"previous_model_archived":True,
         "scope": "native launcher/backend activation; isolated directory, no installer registration changes"}
     output = ROOT / "work" / "native-update-verification.json"
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

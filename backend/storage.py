@@ -28,6 +28,28 @@ import pymysql
 
 SCHEMA_VERSION = 1
 TABLES = ("project", "project_revision", "change_event", "job_run", "confirmation_snapshot", "file_asset", "app_setting", "backup_record")
+MAX_PACKET_BYTES = 64 * 1024 * 1024
+
+
+class StorageError(RuntimeError):
+    def __init__(self, code, message, details=None):
+        self.code = code
+        self.details = details or {}
+        super().__init__(message)
+
+
+class PacketBoundedCursor(pymysql.cursors.DictCursor):
+    """Bound the escaped UTF-8 command, not the unescaped JSON character count."""
+    def execute(self, query, args=None):
+        query = self.mogrify(query, args)
+        connection = self._get_db()
+        encoded = query.encode(connection.encoding, 'surrogateescape') if isinstance(query, str) else query
+        limit = getattr(connection, 'pilot_packet_limit', MAX_PACKET_BYTES)
+        if len(encoded) + 1024 >= limit:
+            raise StorageError('STORAGE_PAYLOAD_TOO_LARGE',
+                '저장 데이터가 DB 전송 한도를 초과했습니다. 기존 저장본은 유지되며 계산 결과와 진단 파일을 확인해 주세요.',
+                {'query_bytes': len(encoded), 'packet_limit_bytes': limit})
+        return super().execute(query)
 
 
 def now():
@@ -95,6 +117,7 @@ class MariaServer:
         self.runtime = Path(explicit).resolve() if explicit else Path(resources).resolve() / "runtime" / "mariadb"
         self.process = self.lock = self.log = None
         self.config = None
+        self.packet_limit = MAX_PACKET_BYTES
 
     def _persist(self):
         atomic_json(self.root / "config" / "mariadb.protected.json", {
@@ -180,7 +203,7 @@ class MariaServer:
                     sql += [f"CREATE USER IF NOT EXISTS 'pilot_app'@'{host}' IDENTIFIED BY '{self.config['password']}';", f"GRANT ALL PRIVILEGES ON pilot_studio_v2.* TO 'pilot_app'@'{host}';"]
                 bootstrap.write_text("\n".join(sql), encoding="utf-8")
             self._persist()
-            command = [str(executable), "--no-defaults", "--basedir=" + str(self.runtime), "--datadir=" + str(dbdir), "--bind-address=127.0.0.1", "--port=" + str(self.config["port"]), "--skip-name-resolve", "--max-connections=40", "--innodb-buffer-pool-size=64M", "--log-error=" + str(logs / "mariadb-error.log")]
+            command = [str(executable), "--no-defaults", "--basedir=" + str(self.runtime), "--datadir=" + str(dbdir), "--bind-address=127.0.0.1", "--port=" + str(self.config["port"]), "--skip-name-resolve", "--max-connections=40", "--max-allowed-packet=" + str(MAX_PACKET_BYTES), "--innodb-buffer-pool-size=64M", "--log-error=" + str(logs / "mariadb-error.log")]
             if bootstrap.exists():
                 command.append("--init-file=" + str(bootstrap))
             self.log = (logs / "mariadb-process.log").open("ab")
@@ -192,6 +215,9 @@ class MariaServer:
                     raise RuntimeError("MARIADB_START_FAILED: 데이터베이스 진단 로그를 확인해 주세요.")
                 try:
                     connection = pymysql.connect(**self.options(), connect_timeout=1)
+                    with connection.cursor() as cursor:
+                        cursor.execute('SELECT @@max_allowed_packet')
+                        self.packet_limit = int(cursor.fetchone()[0])
                     connection.close()
                     self.config.pop("bootstrap_pending", None)
                     self._persist()
@@ -244,15 +270,31 @@ class Storage:
 
     @contextmanager
     def connect(self):
-        connection = pymysql.connect(**self.server.options(), charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor, autocommit=False, connect_timeout=5)
+        connection = None
         try:
+            connection = pymysql.connect(**self.server.options(), charset="utf8mb4", cursorclass=PacketBoundedCursor,
+                autocommit=False, connect_timeout=5, max_allowed_packet=MAX_PACKET_BYTES)
+            connection.pilot_packet_limit = self.server.packet_limit
             yield connection
             connection.commit()
-        except BaseException:
-            connection.rollback()
+        except BaseException as original:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception as cleanup:
+                    original.add_note('DB rollback also failed: ' + type(cleanup).__name__)
+            if isinstance(original, pymysql.Error):
+                errno = original.args[0] if original.args else None
+                raise StorageError('STORAGE_CONNECTION_FAILED',
+                    'DB 저장 또는 연결에 실패했습니다. 저장 상태와 진단 로그의 최초 오류를 확인해 주세요.',
+                    {'database_error_code': errno, 'exception_type': type(original).__name__}) from original
             raise
         finally:
-            connection.close()
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass  # Closing must never mask the original query/commit failure.
 
     def init(self):
         with self.lock:

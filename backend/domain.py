@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import uuid
+from .planning_settings import DEFAULT_ANALYSIS_SECONDS, DEFAULT_CANDIDATE_SECONDS, DEFAULT_NATIVE_TIMEOUT_SECONDS, TIMEOUT_POLICY_VERSION
 from datetime import datetime, timezone
 
 
@@ -34,7 +35,11 @@ def new_project(fields):
                 created_at=now(), updated_at=now(), input_revision=None, model=None,
                 rules={"fixed_unit_ids": [], "initial_obstacle_ids": [], "precedence": [],
                        "directions": ["+X", "-X", "+Y", "-Y", "+Z", "-Z"],
-                       "beam_width": 4, "max_seconds": 300, "contact_policies": []},
+                       "collision_policy": {"mode": "nominal_interference", "reference_mode":"assembled_reference"},
+                       "beam_width": 4, "max_seconds": DEFAULT_ANALYSIS_SECONDS, "validation_seconds":DEFAULT_ANALYSIS_SECONDS, "contact_policies": [],
+                       "generation_method":"disassembly_reverse", "direction_candidate_count":2,
+                       "candidate_seconds":DEFAULT_CANDIDATE_SECONDS, "native_timeout_seconds":DEFAULT_NATIVE_TIMEOUT_SECONDS,
+                       "timeout_policy_version":TIMEOUT_POLICY_VERSION, "extraction_margin_mm":5, "direction_change_cost":10},
                 plan={"id":uid("plan-"), "revision":1, "steps":[], "status":"EMPTY"},
                 validation=None, status="EMPTY", exports=[])
 
@@ -50,7 +55,7 @@ def expect(project, expected):
 def model_hash(project):
     model=project.get("model") or {}
     return digest({"input_revision":project.get("input_revision"),"fingerprint":model.get("fingerprint"),
-                   "units":[{k:u.get(k) for k in ("id","occurrence_ids","fixed","role")} for u in model.get("units",[])],
+                   "units":[{k:u.get(k) for k in ("id","occurrence_ids","fixed","role","match_file_id","matching")} for u in model.get("units",[])],
                    "quality":model.get("quality")})
 
 
@@ -60,12 +65,43 @@ def geometry_hash(project):
                             for s in (project.get("plan") or {}).get("steps",[])]})
 
 
+def process_profile_hash(project):
+    return digest({"model":model_hash(project),"fixed_unit_ids":sorted((project.get("rules") or {}).get("fixed_unit_ids",[])),
+                   "unit_names":[(u["id"],u.get("name")) for u in (project.get("model") or {}).get("units",[])]})
+
+
 def confirmation_hash(project):
     """Identity of confirmed content, independent of export/job bookkeeping."""
     content={key:copy.deepcopy(project.get(key)) for key in ("id","name","vehicle","item","part_number","input_revision","source_files","model","rules","plan","validation")}
     if isinstance(content.get("plan"),dict):
         content["plan"].pop("status",None);content["plan"].pop("revision",None)
     return digest(content)
+
+
+def executable_step(step):
+    """Fail closed for old snapshots, unverified intents, and stale path vectors."""
+    path=step.get("path") or {}
+    if not isinstance(path,dict) or not (step.get("status")=="PASS" and step.get("executable") is True
+            and path.get("verified") is True and path.get("executable") is True and path.get("kind")=="translation"):
+        return False
+    axes={"+X":[1,0,0],"-X":[-1,0,0],"+Y":[0,1,0],"-Y":[0,-1,0],"+Z":[0,0,1],"-Z":[0,0,-1]}
+    axis=axes.get(step.get("direction"));distance=step.get("distance_mm")
+    if axis is None or type(distance) not in (int,float) or not math.isfinite(distance) or distance<=0:return False
+    for key,expected in (("start_translation_mm",[-x*distance for x in axis]),("end_translation_mm",[0,0,0])):
+        values=path.get(key)
+        if not isinstance(values,list) or len(values)!=3:return False
+        if any(type(v) not in (int,float) or not math.isfinite(v) or abs(v-e)>1e-8 for v,e in zip(values,expected)):return False
+    return True
+
+
+def playback_summary(steps):
+    count=0
+    for step in steps:
+        if not executable_step(step):break
+        count+=1
+    return {"policy":"verified_prefix_only","executable_prefix_count":count,"total_count":len(steps),
+            "blocked_count":sum(s.get("planning_state")=="BLOCKED" for s in steps),
+            "unplanned_count":len(steps)-count}
 
 
 def coverage(project):
@@ -97,8 +133,32 @@ def check_units(model, units):
                           {"missing":sorted(source-set(members)),"unknown":sorted(set(members)-source)})
 
 
+def refresh_matching_quality(model):
+    units=model.get("units",[]);quality=model.setdefault("quality",{})
+    statuses=[(u.get("matching",{}).get("geometry_verification") or {}).get("status") for u in units]
+    quality["matching_geometry_verified_units"]=statuses.count("PASS")
+    quality["matching_geometry_review_units"]=statuses.count("REVIEW")
+    quality["matching_geometry_unverified_units"]=sum(s not in ("PASS","REVIEW","NOT_APPLICABLE") for s in statuses)
+    quality["matching_geometry_not_applicable_units"]=statuses.count("NOT_APPLICABLE")
+    diagnostic_codes={d.get("code") for d in model.get("diagnostics",[]) if isinstance(d,dict)}
+    template_failures="PART_IMPORT_FAILED" in diagnostic_codes
+    explicit_scope=all(status=="PASS" or (status=="NOT_APPLICABLE" and u.get("matching",{}).get("method")=="explicit_user_unit") for u,status in zip(units,statuses))
+    unresolved_search=bool(diagnostic_codes&{"MATCH_AMBIGUOUS","MATCH_SEARCH_LIMITED"}) and not explicit_scope
+    quality["matching_ready"]=quality.get("inventory_complete",True) and not template_failures and not unresolved_search and not any(u.get("matching",{}).get("review_required") for u in units) and not quality["matching_geometry_unverified_units"]
+    quality["status"]="PASS" if (quality.get("inventory_complete") and quality.get("display_ready") and quality.get("collision_ready") and quality["matching_ready"] and not quality.get("exact_method_disagreement_ids") and not any(p.get("exact_method_unverified_ids") for p in quality.get("part_geometry",[]))) else "LIMITED"
+
+
 def check_rules(model, rules):
+    from .planning_settings import settings_errors
+    errors=settings_errors(model,rules)
+    if errors:raise DomainError(errors[0]['code'],"방향 제약 또는 탐색 설정을 확인해 주세요.",{'errors':errors})
     ids={u["id"] for u in model.get("units",[])}
+    collision_policy=rules.get("collision_policy") or {}
+    if not isinstance(collision_policy,dict) or collision_policy.get("mode","nominal_interference") not in {"nominal_interference","uncertainty_clearance"}:
+        raise DomainError("INVALID_COLLISION_POLICY","간섭 검사 기준이 올바르지 않습니다.")
+    clearance=collision_policy.get("minimum_clearance_mm",0.)
+    if type(clearance) not in (int,float) or not math.isfinite(clearance) or clearance<0:
+        raise DomainError("INVALID_COLLISION_POLICY","최소 여유는 0 이상의 유한한 mm 값이어야 합니다.")
     for key in ("fixed_unit_ids","initial_obstacle_ids"):
         if not set(rules.get(key,[]))<=ids:
             raise DomainError("UNKNOWN_UNIT","고정/초기 부품에 존재하지 않는 단위가 있습니다.")
@@ -119,8 +179,16 @@ def check_rules(model, rules):
         for nxt in edges[node]:visit(nxt)
         active.remove(node);visited.add(node)
     for node in ids:visit(node)
-    for key,low,high in (("max_seconds",1,7200),("beam_width",1,32)):
-        value=rules.get(key,300 if key=="max_seconds" else 4)
+    from .process_rules import compile_process_rules
+    initial=set(rules.get("fixed_unit_ids",[]))|set(rules.get("initial_obstacle_ids",[]))
+    process=compile_process_rules(model,rules,initial,ids-initial)
+    if process.get("errors"):
+        raise DomainError("INVALID_PROCESS_RULE", "부품별 고정 규칙의 대상·중복·체결 순서를 확인해 주세요.", {"errors":process["errors"]})
+    for a,b in process.get("edges",[]):edges[a].add(b)
+    visited.clear();active.clear()
+    for node in ids:visit(node)
+    for key,low,high in (("max_seconds",1,7200),("beam_width",1,8)):
+        value=rules.get(key,DEFAULT_ANALYSIS_SECONDS if key=="max_seconds" else 4)
         if not isinstance(value,(int,float)) or not math.isfinite(value) or not low<=value<=high:
             raise DomainError("INVALID_BUDGET",f"{key} 설정이 허용 범위를 벗어났습니다.")
     for policy in rules.get("contact_policies",[]):
@@ -140,15 +208,27 @@ def patch_project(project, patch):
     if "units" in patch:
         if not result.get("model"):raise DomainError("MODEL_REQUIRED","먼저 STEP을 등록해 주세요.")
         check_units(result["model"],patch["units"])
+        previous_units={u["id"]:u for u in result["model"]["units"]}
         result["model"]["units"]=copy.deepcopy(patch["units"])
         occurrences={o["id"]:o for o in result["model"]["occurrences"]}
         for unit in result["model"]["units"]:
+            old=previous_units.get(unit["id"],{})
+            old_match=old.get("matching") or {};new_match=unit.get("matching") or {}
+            same_mapping=old and old.get("occurrence_ids")==unit.get("occurrence_ids") and old_match.get("template_name")==new_match.get("template_name") and old.get("match_file_id")==unit.get("match_file_id")
+            if same_mapping:unit["matching"]=copy.deepcopy(old_match)
+            elif new_match.get("template_name"):
+                unit["matching"]={"method":"manual","status":"review_required","template_name":new_match["template_name"],"review_required":True,
+                                  "geometry_verification":{"status":"REVIEW","reason":"MANUAL_MAPPING_CHANGED"}}
+            else:
+                unit["matching"]={"method":"explicit_user_unit","status":"manual","review_required":False,
+                                  "geometry_verification":{"status":"NOT_APPLICABLE","reason":"USER_DEFINED_UNIT"}}
             members=[occurrences[x] for x in unit["occurrence_ids"]]
             boxes=[m["bbox"] for m in members]
             low=[min(b["min"][i] for b in boxes) for i in range(3)]
             high=[max(b["max"][i] for b in boxes) for i in range(3)]
             unit["bbox"]={"min":low,"max":high,"size":[b-a for a,b in zip(low,high)],"center":[(a+b)/2 for a,b in zip(low,high)]}
             unit["collision_ready"]=all(m.get("collision_ready",False) for m in members)
+        refresh_matching_quality(result["model"])
     if "rules" in patch:
         result["rules"].update(copy.deepcopy(patch["rules"]))
         check_rules(result.get("model") or {},result["rules"])
@@ -171,15 +251,29 @@ def patch_project(project, patch):
                 raise DomainError("INVALID_DURATION","단계 재생 시간은 0.2~120초의 유한한 값이어야 합니다.")
             step_ids.append(step["id"])
         if len(step_ids)!=len(set(step_ids)):raise DomainError("DUPLICATE_STEP","단계 ID가 중복됩니다.")
-        result["plan"]["steps"]=copy.deepcopy(changes["steps"])
+        # Clients edit work information and intent, never geometric proof.
+        previous={s["id"]:s for s in project["plan"].get("steps",[])}
+        incoming=copy.deepcopy(changes["steps"])
+        proof_keys=("status","executable","planning_state","reason","diagnostics","rejected_candidate_summary")
+        for step in incoming:
+            old=previous.get(step["id"],{})
+            for key in proof_keys:
+                if key in old:step[key]=copy.deepcopy(old[key])
+                else:step.pop(key,None)
+            unchanged=all(step.get(k)==old.get(k) for k in ("unit_id","direction","distance_mm","path"))
+            step["path"]=copy.deepcopy(old.get("path")) if unchanged else None
+        result["plan"]["steps"]=incoming
         result["plan"]["revision"]=result["plan"].get("revision",0)+1
         result["plan"]["status"]="DRAFT"
     if geometry_hash(result)!=before:
+        if result.get('generation_report'):result['generation_report']['stale']=True
         result["validation"]=None
         result["plan"]["status"]="NEEDS_VALIDATION"
         for step in result["plan"].get("steps",[]):
             step["status"]="UNKNOWN"
-            if isinstance(step.get("path"),dict):step["path"]["verified"]=False
+            step.update(executable=False,planning_state="UNPLANNED",reason="EDIT_REQUIRES_VALIDATION",path=None,
+                        proposed_entry={"direction":step.get("direction"),"distance_mm":step.get("distance_mm")})
+    result["plan"]["playback"]=playback_summary(result["plan"].get("steps",[]))
     result["revision"]+=1
     result["updated_at"]=now()
     result["status"]="DRAFT" if result["plan"].get("steps") else result["status"]
@@ -195,13 +289,7 @@ def confirmation_errors(project, release=None):
         problems.append("현재 프로그램 버전으로 조립성 검증을 다시 실행해 주세요.")
     if not coverage(project)["complete"]:problems.append("계획의 조립 단위가 누락되거나 중복되었습니다.")
     for index,step in enumerate(project.get("plan",{}).get("steps",[]),1):
-        if step.get("reviewed") is not True:problems.append(f"{index}단계 작업 정보 검토가 필요합니다.")
-        if not str(step.get("caution") or "").strip() and step.get("caution_reviewed") is not True:
-            problems.append(f"{index}단계 주의사항을 입력하거나 검토 결과 없음을 표시해 주세요.")
-        torque=step.get("torque")
-        value=torque.get("value") if isinstance(torque,dict) else torque
-        if step.get("torque_status") not in ("required","not_applicable"):
-            problems.append(f"{index}단계 체결 토크 또는 해당 없음을 지정해 주세요.")
-        if step.get("torque_status")=="required" and (isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0 or (isinstance(torque,dict) and torque.get("unit","N·m") not in ("N·m","kgf·cm"))):
-            problems.append(f"{index}단계 체결 토크를 입력해 주세요.")
+        if not executable_step(step):problems.append(f"{index}단계에 재생 가능한 검증 경로가 없습니다.")
+    # Work instructions are optional video metadata, independent of motion proof.
+    # Do not require an editorial review or manufacture empty/none declarations.
     return problems

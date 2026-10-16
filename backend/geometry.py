@@ -49,8 +49,8 @@ except ImportError:  # compatible with OCP 7.x
     from OCP.TopTools import TopTools_ListOfShape as ShapeList
 
 ALGORITHM_VERSION = "pilot-v2-cad-2.0.0"
-MATCHING_VERSION = "constellation-pruned-2.0.1"
-REPAIR_VERSION = "bounded-representation-2.0.1"
+MATCHING_VERSION = "brep-verified-constellation-2.1.7"
+REPAIR_VERSION = "analysis-geometry-2.4.0"
 AXES = {"+X": [1, 0, 0], "-X": [-1, 0, 0], "+Y": [0, 1, 0], "-Y": [0, -1, 0], "+Z": [0, 0, 1], "-Z": [0, 0, -1]}
 SETTINGS = {"algorithm": ALGORITHM_VERSION, "engine": f"OCCT/OCP {OCP.__version__}", "length_unit": "mm", "coordinate_system": "RH_Z_UP_MM", "linear_tolerance_mm": 1e-5, "volume_tolerance_mm3": 1e-4, "mesh_deflection_mm": 0.35, "mesh_angular_deflection_rad": 0.35}
 
@@ -412,7 +412,7 @@ def _role(name):
     return "component"
 
 
-def match_units(assembly, templates, max_combinations=25000):
+def match_units(assembly, templates, max_combinations=25000, shape_verifier=None):
     """Multiplicity-aware template grouping, with no product-specific ID rules.
 
     Compound candidates must preserve constituent fingerprints and complete
@@ -424,17 +424,35 @@ def match_units(assembly, templates, max_combinations=25000):
     remaining = {o["id"]: o for o in occurrences}
     units, diagnostics = [], []
 
-    def add(members, template=None, evidence=None):
+    def verify(members, template):
+        if shape_verifier is None:
+            return None
+        from .geometry_matching import group_alignment_audit
+        pairs=[(source,target,shape_verifier.compare(source,target)) for source,target in zip(template["instances"],members)]
+        group=group_alignment_audit(pairs)
+        return {"status":"PASS" if all(r["status"]=="PASS" for _,_,r in pairs) and group["status"]=="PASS" else "REVIEW",
+            "member_count":len(pairs), "members":[{"template_occurrence_id":source["id"],"occurrence_id":target["id"],**result} for source,target,result in pairs],
+            "group_alignment":group}
+
+    def add(members, template=None, evidence=None, verification=None):
         ids = sorted(o["id"] for o in members)
         uid = "unit_"+hashlib.sha256("|".join(ids).encode()).hexdigest()[:18]
         name = Path(template["source"]["name"]).stem if template else members[0]["name"]
         role = _role(name+" "+" ".join(o["name"] for o in members))
+        if template and shape_verifier is not None and verification is None:
+            verification=verify(members,template)
+        if template is None:
+            verification={"status":"NOT_APPLICABLE","reason":"CAD_LEAF_WITHOUT_TEMPLATE"}
+        needs_review=bool(template and verification and verification["status"]!="PASS")
+        if needs_review:
+            diagnostics.append({"code":"MATCH_GEOMETRY_REVIEW","severity":"review_required","message":template["source"]["name"],
+                "unit_id":uid,"occurrence_ids":ids,"verification":verification})
         units.append({"id":uid,"name":name,"occurrence_ids":ids,"bbox":combine_bbox([o["bbox"] for o in members]),
             "fixed":False,"fixed_candidate":role == "housing","role":role,"hidden":False,
             "collision_ready":all(o.get("collision_ready",o.get("valid",False)) for o in members),
-            "matching":{"status":"matched" if template else "cad_leaf", "method":"metadata_features_constellation" if template else "CAD leaf fallback",
+            "matching":{"status":("review_required" if needs_review else "matched") if template else "cad_leaf", "method":("bidirectional_brep_and_rigid_group" if verification else "metadata_features_constellation") if template else "CAD leaf fallback",
                 "template_name":template["source"]["name"] if template else None,"evidence":evidence or {},
-                "review_required":False},"solid_count":sum(o["solid_count"] for o in members)})
+                "review_required":needs_review,"geometry_verification":verification},"solid_count":sum(o["solid_count"] for o in members)})
         for ident in ids: remaining.pop(ident,None)
 
     for template in sorted(templates,key=lambda t:-len(t["instances"])):
@@ -447,6 +465,21 @@ def match_units(assembly, templates, max_combinations=25000):
                 name_equal = _canonical_name(leaf["name"]) in (_canonical_name(candidate["name"]),_canonical_name(candidate["definition_name"]))
                 if score is not None and (name_equal or score < 0.00005):
                     scored.append((candidate,score,name_equal))
+            if shape_verifier is not None:
+                retained=[];proven=[]
+                for candidate,score,name_equal in scored:
+                    check=shape_verifier.compare(leaf,candidate)
+                    if check["status"]=="DIFFERENT":
+                        diagnostics.append({"code":"MATCH_GEOMETRY_DIFFERENT","severity":"review_required","message":template["source"]["name"],
+                            "occurrence_id":candidate["id"],"verification":check})
+                    else:
+                        retained.append((candidate,score,name_equal))
+                        if check["status"]=="PASS":proven.append((candidate,score,name_equal))
+                if len({c["definition_id"] for c,_,_ in retained})>1 and proven:
+                    # Analytic shape evidence precedes a potentially stale
+                    # CAD name when distinct definitions compete.
+                    retained=proven
+                scored=retained
             # Repeated placements of a single definition are all legitimate.
             definitions = {c["definition_id"] for c,_,_ in scored}
             if len(definitions)>1:
@@ -498,9 +531,26 @@ def match_units(assembly, templates, max_combinations=25000):
                 if compatible:
                     selected[index]=ident;visit(depth+1);selected.pop(index)
         visit(0)
+        if len(found)>1 and shape_verifier is not None:
+            proven={}
+            for key,(targets,error) in found.items():
+                check=verify(targets,template)
+                if check["status"]=="PASS":proven[key]=(targets,error)
+            if len(proven)==1:found=proven
         if len(found)==1:
             targets,error=next(iter(found.values()))
-            add(targets,template,{"constellation_max_error_mm":error,"tested_combinations":tested,"member_count":len(targets)})
+            verification=None
+            if exhausted:
+                # A proved candidate is not a proved unique assignment while
+                # other constellations remain unexamined within the budget.
+                verification={**(verify(targets,template) or {}),"status":"REVIEW",
+                    "reason":"MATCH_CANDIDATE_SEARCH_INCOMPLETE",
+                    "candidate_search":{"complete":False,"tested_combinations":tested,"budget":max_combinations}}
+                diagnostics.append({"code":"MATCH_SEARCH_LIMITED","severity":"review_required",
+                    "message":template["source"]["name"],"tested_combinations":tested,"candidate_group_count":len(found)})
+            add(targets,template,{"constellation_max_error_mm":error,"tested_combinations":tested,"member_count":len(targets),
+                "candidate_search_complete":not exhausted,
+                "member_correspondence":[{"template_occurrence_id":a["id"],"occurrence_id":b["id"]} for a,b in zip(leaves,targets)]},verification)
         elif found or exhausted:
             diagnostics.append({"code":"MATCH_SEARCH_LIMITED" if exhausted else "MATCH_AMBIGUOUS","severity":"review_required","message":template["source"]["name"],"tested_combinations":tested,"candidate_group_count":len(found)})
         else:
@@ -514,68 +564,232 @@ def match_units(assembly, templates, max_combinations=25000):
     return units,diagnostics
 
 
+def verify_unit_mappings(model,cache_dir,progress=None,cancel=None,unit_ids=None):
+    """Recheck manual template/member edits without changing unit identities.
+
+    The worker returns matching fields only. Caller applies them with the
+    original project revision check; no regrouping, renaming, or plan change
+    is hidden in this operation.
+    """
+    from .geometry_matching import ShapeVerifier
+    known={unit["id"] for unit in model["units"]}
+    if unit_ids is not None and (not isinstance(unit_ids,list) or not unit_ids or
+            any(not isinstance(ident,str) for ident in unit_ids) or len(unit_ids)!=len(set(unit_ids)) or not set(unit_ids)<=known):
+        raise ValueError("MATCH_INVALID_UNIT_SCOPE")
+    chosen=set(unit_ids) if unit_ids is not None else None
+    sources={source["name"]:source for source in model.get("part_sources",[])}
+    occurrences={o["id"]:o for o in model["occurrences"]}
+    templates={}; results=[];diagnostics=[]
+    verifier=ShapeVerifier(cache_dir,progress=progress,cancel=cancel)
+    for unit in model["units"]:
+        if chosen is not None and unit["id"] not in chosen:continue
+        if cancel and cancel():raise InterruptedError("MATCHING_CANCELLED")
+        name=unit.get("matching",{}).get("template_name")
+        if not name:
+            previous=unit.get("matching") or {};review=bool(previous.get("review_required"))
+            # Explicit user units and CAD leaves need no external part-file
+            # identity certificate. Rechecking them must neither invent a
+            # missing-template failure nor endorse a submitted PASS object.
+            explicit=previous.get("method")=="explicit_user_unit"
+            result={"status":"review_required" if review else ("manual" if explicit else "cad_leaf"),
+                "method":"explicit_user_unit" if explicit else "CAD leaf fallback","template_name":None,"review_required":review,
+                "geometry_verification":{"status":"REVIEW" if review else "NOT_APPLICABLE",
+                    "reason":"EXISTING_MAPPING_REVIEW_REQUIRED" if review else ("USER_DEFINED_UNIT" if explicit else "CAD_LEAF_WITHOUT_TEMPLATE")}}
+            results.append({"unit_id":unit["id"],"matching":result});continue
+        result={"status":"review_required","method":"manual_geometry_recheck","template_name":name,
+            "review_required":True,"geometry_verification":{"status":"REVIEW","reason":"TEMPLATE_NOT_REGISTERED"}}
+        if name in sources:
+            if name not in templates:
+                source=sources[name];path=Path(source["path"])
+                data=path.read_bytes();digest=hashlib.sha256(data).hexdigest()
+                if source.get("sha256") and digest!=source["sha256"]:
+                    raise ValueError("MATCH_SOURCE_HASH_MISMATCH")
+                # Managed immutable assets may use an extensionless hash as
+                # their storage name. Recreate a read-only import copy with
+                # the registered STEP basename and verify its content hash.
+                if path.name!=Path(name).name or path.suffix.lower() not in (".stp",".step"):
+                    folder=Path(cache_dir)/"matching-imports"/digest[:24];folder.mkdir(parents=True,exist_ok=True)
+                    path=folder/Path(name).name
+                    if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest()!=digest:
+                        temporary=path.with_suffix(path.suffix+"."+uuid.uuid4().hex+".tmp")
+                        temporary.write_bytes(data);temporary.replace(path)
+                template=import_step(path,cache_dir,progress)
+                template["source"]={**template["source"],"name":name}
+                templates[name]=repair_occurrences(template,cache_dir,progress,cancel)
+            members=[occurrences[i] for i in unit["occurrence_ids"] if i in occurrences]
+            proposals,issues=match_units({"instances":members},[templates[name]],shape_verifier=verifier)
+            exact=[p for p in proposals if set(p["occurrence_ids"])==set(unit["occurrence_ids"]) and p["matching"].get("template_name")==name]
+            if len(exact)==1:
+                result=exact[0]["matching"]
+            else:
+                result["geometry_verification"]["reason"]="TEMPLATE_MEMBER_SET_NOT_PROVEN"
+            diagnostics.extend({**issue,"unit_id":unit["id"]} for issue in issues)
+        results.append({"unit_id":unit["id"],"matching":result})
+    return {"unit_results":results,"matching_ready":all(not r["matching"]["review_required"] for r in results),
+        "diagnostics":diagnostics,"matching_version":MATCHING_VERSION}
+
+
+class _RepairResultFile:
+    """Single atomic reply, without Windows shared-semaphore queue handles."""
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def put(self, value):
+        from .jobs import atomic_json
+        atomic_json(self.path, value)
+
+
+def _run_repair_attempt(source, candidate, audit_file, timeout_seconds, cancel=None):
+    import multiprocessing as mp
+    reply = candidate.with_name(candidate.stem + '.' + uuid.uuid4().hex + '.reply.json')
+    context = mp.get_context('spawn')
+    process = context.Process(target=_repair_worker,
+        args=(source.resolve(), candidate.resolve(), audit_file.resolve(), _RepairResultFile(reply.resolve())), daemon=True)
+    process.start()
+    stop = time.monotonic() + timeout_seconds
+    try:
+        while time.monotonic() < stop:
+            if cancel and cancel():
+                raise InterruptedError('PREPROCESS_CANCELLED')
+            if reply.is_file():
+                value = json.loads(reply.read_text(encoding='utf-8'))
+                if not isinstance(value, dict) or value.get('status') not in ('accepted', 'already_valid', 'exact_review_required', 'blocked'):
+                    raise ValueError('NATIVE_REPAIR_REPLY_INVALID')
+                return value
+            if not process.is_alive():
+                # The child may have published between the first file check
+                # and observing exit. Recheck its unique atomic reply once.
+                if reply.is_file():
+                    continue
+                break
+            time.sleep(min(.05, max(0., stop-time.monotonic())))
+        return {'status':'blocked', 'reason':'NATIVE_REPAIR_TIMEOUT_OR_FAILURE'}
+    finally:
+        if process.is_alive():
+            process.join(timeout=min(.2, max(0., stop-time.monotonic())))
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=2)
+        if not process.is_alive():
+            process.close()
+        try:
+            reply.unlink(missing_ok=True)
+        except OSError:
+            pass  # A leftover unique reply is never accepted by another attempt.
+
+
 def _repair_worker(source_path,candidate_path,audit_path,result_queue):
-    from .representation_repair import verified_topology_repair
+    from .representation_repair import (verified_topology_repair, verified_exact_representation_repair,
+        max_tolerances, support_geometry, boundary_manifest, pcurve_manifest, copied)
     try:
         original=TopoDS_Shape()
         if not BRepTools.Read_s(original,str(source_path),BRep_Builder()):raise ValueError("REPAIR_SOURCE_READ_FAILED")
-        candidate,audit=verified_topology_repair(original)
+        source_standard=bool(BRepCheck_Analyzer(original).IsValid())
+        candidate=None;topology_audit=None
+        if not source_standard:candidate,topology_audit=verified_topology_repair(original)
+        working=candidate if candidate is not None else original
+        calibration_source=working
+        calibrated,exact_audit=verified_exact_representation_repair(working,allow_coarse_calibration=True)
+        if calibrated is not None:candidate=calibrated;working=calibrated
+        standard=bool(BRepCheck_Analyzer(working).IsValid())
+        exact=bool(BRepCheck_Analyzer(working,True,False,True).IsValid())
+        status="accepted" if candidate is not None and standard and exact else "already_valid" if standard and exact else "exact_review_required" if standard else "blocked"
+        method=exact_audit.get("accepted_method") or (topology_audit or {}).get("accepted_method")
+        audit={"schema_version":3,"status":status,"accepted_method":method,
+            "source_standard_valid":source_standard,"source_modified":False,
+            "topology_repair":topology_audit,"exact_representation_validation":exact_audit,
+            "roundtrip_standard_valid":standard,"roundtrip_exact_valid":exact,
+            "representation_uncertainty_mm":exact_audit.get("representation_uncertainty_mm"),
+            "calibration_budget":exact_audit.get("calibration_budget"),
+            "analysis_scope":exact_audit.get("analysis_scope","exact_occt_preserved_geometry" if exact else "standard_occt_exact_review_required")}
         if candidate is not None:
-            if not BRepTools.Write_s(candidate,str(candidate_path)):raise ValueError("REPAIR_WRITE_FAILED")
+            if not BRepTools.Write_s(working,str(candidate_path)):raise ValueError("REPAIR_WRITE_FAILED")
             reread=TopoDS_Shape()
             if not BRepTools.Read_s(reread,str(candidate_path),BRep_Builder()) or not BRepCheck_Analyzer(reread).IsValid():
                 raise ValueError("REPAIR_ROUNDTRIP_INVALID")
-            standard=BRepCheck_Analyzer(reread).IsValid()
-            exact=BRepCheck_Analyzer(reread,True,False,True).IsValid()
+            standard=bool(BRepCheck_Analyzer(reread).IsValid())
+            roundtrip_exact=bool(BRepCheck_Analyzer(reread,True,False,True).IsValid())
+            if exact and not roundtrip_exact:raise ValueError("REPAIR_ROUNDTRIP_EXACT_INVALID")
+            # OCCT normalizes analytic axes while reading BREP. Compare both
+            # unmodified-calibration baseline and candidate after the SAME
+            # serialization, without introducing any floating-point allowance.
+            baseline_path=Path(candidate_path).with_suffix('.canonical-source.brep')
+            # Calibration deep-copies geometry. Use the identical copy step for
+            # the untouched baseline: local placements can be stored differently
+            # after Copy even though placed full-double geometry is unchanged.
+            serialization_source=copied(calibration_source) if calibrated is not None else calibration_source
+            if not BRepTools.Write_s(serialization_source,str(baseline_path)):raise ValueError("REPAIR_BASELINE_WRITE_FAILED")
+            baseline=TopoDS_Shape()
+            if not BRepTools.Read_s(baseline,str(baseline_path),BRep_Builder()):raise ValueError("REPAIR_BASELINE_READ_FAILED")
+            roundtrip_identity={"serialized_baseline_placed_3d_supports_unchanged":support_geometry(baseline)==support_geometry(reread),
+                "serialized_baseline_face_wire_3d_trims_and_vertices_unchanged":boundary_manifest(baseline)==boundary_manifest(reread),
+                "serialized_baseline_every_2d_pcurve_and_range_unchanged":pcurve_manifest(baseline)==pcurve_manifest(reread)}
+            if not all(roundtrip_identity.values()):raise ValueError("REPAIR_ROUNDTRIP_GEOMETRY_CHANGED")
+            audit["roundtrip_preservation_checks"]=roundtrip_identity
+            audit["roundtrip_comparison_basis"]="Full-double exact comparison against unchanged calibration source after identical deep-copy and BREP serialization/read normalization; no numerical comparison tolerance. In-memory source/candidate identity is checked independently."
+            audit["roundtrip_calibration_source_path"]=str(baseline_path)
+            exact=roundtrip_exact
             audit["roundtrip_standard_valid"]=standard;audit["roundtrip_exact_valid"]=exact
         _write_json(Path(audit_path),audit)
-        result_queue.put({"status":audit["status"],"candidate_path":str(candidate_path) if candidate is not None else None,
-            "audit_path":str(audit_path),"standard_valid":audit.get("roundtrip_standard_valid",False),"exact_valid":audit.get("roundtrip_exact_valid"),"method":audit.get("accepted_method")})
+        result_queue.put({"status":status,"candidate_path":str(candidate_path) if candidate is not None else None,
+            "audit_path":str(audit_path),"standard_valid":standard,"exact_valid":exact,"method":method,
+            "source_sha256":hashlib.sha256(Path(source_path).read_bytes()).hexdigest(),
+            "analysis_brep_sha256":hashlib.sha256(Path(candidate_path if candidate is not None else source_path).read_bytes()).hexdigest(),
+            "audit_sha256":hashlib.sha256(Path(audit_path).read_bytes()).hexdigest(),
+            "reason":exact_audit.get("reason") if not exact else None,
+            "representation_uncertainty_mm":audit["representation_uncertainty_mm"],
+            "analysis_scope":audit["analysis_scope"],
+            "calibration_budget":audit["calibration_budget"],
+            "source_exact_valid":exact_audit.get("source_exact_valid"),
+            "collision_clearance_guard_required":bool(exact_audit.get("collision_clearance_guard_required"))})
     except BaseException as exc:result_queue.put({"status":"blocked","reason":f"{type(exc).__name__}: {exc}"})
 
 
-def repair_occurrences(assembly,cache_dir,progress=None,cancel=None,timeout_seconds=90):
+def repair_occurrences(assembly,cache_dir,progress=None,cancel=None,timeout_seconds=300):
     """Only proven representation changes; each native attempt is terminable.
 
     Exact-check disagreement remains visible. Collision use is scoped to the
     standard OCCT representation policy, not an unconditional CAD certificate.
     """
-    import multiprocessing as mp
-    import queue
     directory=Path(cache_dir)/REPAIR_VERSION;directory.mkdir(parents=True,exist_ok=True)
     for index,row in enumerate(assembly["instances"]):
-        if row.get("valid"):continue
         if progress:progress({"stage":"geometry_repair","message":row["name"],"current":index+1,"total":len(assembly["instances"])})
         source=Path(row["brep_path"]);sha=hashlib.sha256(source.read_bytes()).hexdigest()
         result_file=directory/(sha[:24]+".json");candidate=directory/(sha[:24]+".brep");audit_file=directory/(sha[:24]+"-audit.json")
         result=None
         if result_file.exists():
             old=json.loads(result_file.read_text(encoding="utf-8"))
-            if old.get("status")=="accepted" and candidate.exists() and audit_file.exists():
-                result={**old,"candidate_path":str(candidate.resolve()),"audit_path":str(audit_file.resolve())}
+            analysis_file=candidate if old.get("candidate_path") else source
+            cache_matches=(old.get("source_sha256")==sha and analysis_file.is_file() and audit_file.is_file()
+                and old.get("analysis_brep_sha256")==hashlib.sha256(analysis_file.read_bytes()).hexdigest()
+                and old.get("audit_sha256")==hashlib.sha256(audit_file.read_bytes()).hexdigest())
+            if old.get("status") in ("accepted","already_valid","exact_review_required") and cache_matches:
+                result={**old,"candidate_path":str(candidate.resolve()) if old.get("candidate_path") else None,"audit_path":str(audit_file.resolve())}
         if result is None:
-            context=mp.get_context("spawn");results=context.Queue()
-            process=context.Process(target=_repair_worker,args=(source.resolve(),candidate.resolve(),audit_file.resolve(),results),daemon=True);process.start()
-            stop=time.monotonic()+timeout_seconds
-            while time.monotonic()<stop and result is None:
-                if cancel and cancel():process.terminate();process.join(timeout=2);raise InterruptedError("PREPROCESS_CANCELLED")
-                try:result=results.get(timeout=.2)
-                except queue.Empty:
-                    if not process.is_alive():break
-            if result is None:result={"status":"blocked","reason":"NATIVE_REPAIR_TIMEOUT_OR_FAILURE"}
-            if process.is_alive():process.terminate()
-            process.join(timeout=2)
+            result=_run_repair_attempt(source,candidate,audit_file,timeout_seconds,cancel)
             _write_json(result_file,result)
         if hashlib.sha256(source.read_bytes()).hexdigest()!=sha:raise ValueError("REPAIR_SOURCE_MODIFIED")
         row["repair"]={**result,"source_sha256":sha,"version":REPAIR_VERSION}
+        row["exact_method_valid"]=result.get("exact_valid")
+        row["representation_uncertainty_mm"]=result.get("representation_uncertainty_mm")
+        row["analysis_scope"]=result.get("analysis_scope","unverified")
+        row["collision_clearance_guard_required"]=result.get("collision_clearance_guard_required",False)
+        row["calibration_budget"]=result.get("calibration_budget")
         if result.get("status")=="accepted" and result.get("standard_valid"):
             row["source_brep_path"]=row["brep_path"];row["brep_path"]=result["candidate_path"]
             row["repaired_valid"]=True;row["collision_ready"]=True
-            row["analysis_scope"]="standard_occt_with_exact_geometry_preservation"
-            row["exact_method_valid"]=result.get("exact_valid")
             assembly["diagnostics"].append({"code":"REPRESENTATION_REPAIR_ACCEPTED","severity":"review_required" if not result.get("exact_valid") else "info",
-                "instance_id":row["id"],"message":"Standard OCCT valid, original 3D geometry/trim/member identities and local tolerance budgets preserved. Exact-method result is independently disclosed.","method":result.get("method"),"exact_method_valid":result.get("exact_valid"),"audit_path":result["audit_path"]})
+                "instance_id":row["id"],"message":"Original geometry retained; both OCCT checks recorded, with measured source uncertainty carried into collision clearance checks.","method":result.get("method"),"exact_method_valid":result.get("exact_valid"),"representation_uncertainty_mm":row["representation_uncertainty_mm"],"audit_path":result["audit_path"]})
+        elif result.get("status")=="already_valid":
+            row["collision_ready"]=True
+        elif result.get("status")=="exact_review_required":
+            if result.get("candidate_path"):
+                row["source_brep_path"]=row["brep_path"];row["brep_path"]=result["candidate_path"]
+                row["repaired_valid"]=bool(result.get("standard_valid"))
+            row["collision_ready"]=False
+            assembly["diagnostics"].append({"code":"EXACT_REPRESENTATION_REVIEW_REQUIRED","severity":"review_required","instance_id":row["id"],"message":result.get("reason"),"audit_path":result.get("audit_path")})
         else:
+            row["collision_ready"]=False
             assembly["diagnostics"].append({"code":"REPRESENTATION_REPAIR_BLOCKED","severity":"review_required","instance_id":row["id"],"message":result.get("reason","No repair passed geometry preservation gates.")})
     return assembly
 
@@ -590,25 +804,46 @@ def preprocess(assembly_path, part_paths, cache_dir, progress=None, cancel=None)
     templates=[]; diagnostics=list(assembly["diagnostics"])
     for index,path in enumerate(part_paths or []):
         report({"stage":"part_import","message":Path(path).name,"current":index+1,"total":len(part_paths)})
-        try:templates.append(import_step(path,cache_dir,report))
+        try:
+            template=import_step(path,cache_dir,report)
+            template=repair_occurrences(template,cache_dir,report,cancel)
+            templates.append(template)
         except Exception as exc:diagnostics.append({"code":"PART_IMPORT_FAILED","severity":"review_required","message":str(exc),"file":Path(path).name})
-    units,matching_diagnostics=match_units(assembly,templates)
+    from .geometry_matching import ShapeVerifier
+    verifier=ShapeVerifier(cache_dir,progress=report,cancel=cancel)
+    units,matching_diagnostics=match_units(assembly,templates,shape_verifier=verifier)
     diagnostics.extend(matching_diagnostics)
     coverage=[ident for unit in units for ident in unit["occurrence_ids"]]
     complete=(len(coverage)==len(set(coverage))==len(assembly["instances"])
         and not any(d.get("code")=="NULL_SHAPE" for d in diagnostics))
     bad=[o["id"] for o in assembly["instances"] if not o["collision_ready"]]
-    review=any(d.get("severity")=="review_required" and d["code"].startswith("MATCH") for d in diagnostics)
-    disagreements=[o["id"] for o in assembly["instances"] if o.get("repaired_valid") and o.get("exact_method_valid") is False]
+    review=any(d.get("severity")=="review_required" and (d["code"].startswith("MATCH") or d["code"]=="PART_IMPORT_FAILED") for d in diagnostics)
+    disagreements=[o["id"] for o in assembly["instances"] if o.get("exact_method_valid") is not True]
+    part_geometry=[{"file":template["source"]["name"],"sha256":template["source"]["sha256"],
+        "occurrence_count":len(template["instances"]),
+        "exact_method_unverified_ids":[o["id"] for o in template["instances"] if o.get("exact_method_valid") is not True],
+        "collision_unready_ids":[o["id"] for o in template["instances"] if not o.get("collision_ready")],
+        "source_warning_count":sum(d.get("count",0) for d in template["diagnostics"] if d["code"]=="STEP_TRANSFER_WARNING"),
+        "representation_uncertainty_mm":None if any(o.get("representation_uncertainty_mm") is None for o in template["instances"]) else max((o["representation_uncertainty_mm"] for o in template["instances"]),default=0.0)} for template in templates]
+    for item in part_geometry:
+        if item["exact_method_unverified_ids"]:
+            diagnostics.append({"code":"PART_GEOMETRY_EXACT_REVIEW","severity":"review_required","message":item["file"],**item})
     display_ready=not any(d["code"]=="TESSELLATION_FAILED" for d in diagnostics)
-    quality={"status":"PASS" if not bad and complete and not review and not disagreements and display_ready else "LIMITED", "inventory_complete":complete,
+    quality={"status":"PASS" if not bad and complete and not review and not disagreements and display_ready and not any(p["exact_method_unverified_ids"] for p in part_geometry) else "LIMITED", "inventory_complete":complete,
         "display_ready":display_ready,"matching_ready":complete and not review,
-        "collision_ready":not bad,"invalid_occurrence_ids":bad,"exact_method_disagreement_ids":disagreements,"geometry_acceptance_scope":"standard_occt_with_preserved_geometry; exact-method disagreements remain review items", "source_warning_count":sum(d.get("count",0) for d in diagnostics if d["code"]=="STEP_TRANSFER_WARNING"),
+        "collision_ready":not bad,"analysis_ready":not bad,"invalid_occurrence_ids":bad,"exact_method_disagreement_ids":disagreements,
+        "automatically_repaired_occurrence_ids":[o["id"] for o in assembly["instances"] if o.get("repair",{}).get("status")=="accepted"],
+        "geometry_acceptance_scope":"Automatic measured representation calibration preserves all placed 3D/2D geometry and requires standard/exact checks after serialization. Passing describes CAD consistency at recorded precision, not manufacturing clearance.", "source_warning_count":sum(d.get("count",0) for d in diagnostics if d["code"]=="STEP_TRANSFER_WARNING"),
+        "part_geometry":part_geometry,"part_warning_count":sum(p["source_warning_count"] for p in part_geometry),
         "unit_count":len(units),"occurrence_count":len(coverage),"solid_count":assembly["metrics"]["solids"],
+        "matching_geometry_verified_units":sum((u["matching"].get("geometry_verification") or {}).get("status")=="PASS" for u in units),
+        "matching_geometry_review_units":sum((u["matching"].get("geometry_verification") or {}).get("status")=="REVIEW" for u in units),
         "unit_results":[{"unit_id":u["id"],"collision_ready":u["collision_ready"],"matching_ready":not u["matching"]["review_required"]} for u in units]}
-    fingerprint=hashlib.sha256(json.dumps({"sources":[assembly["source"]["sha256"]]+[t["source"]["sha256"] for t in templates],"units":[u["occurrence_ids"] for u in units],"settings":SETTINGS,"matching_version":MATCHING_VERSION,"repair_version":REPAIR_VERSION,"repair_results":[o.get("repair",{}).get("status") for o in assembly["instances"]]},sort_keys=True).encode()).hexdigest()
+    from .representation_repair import EXACT_CALIBRATION_POLICY
+    repair_evidence=[{key:o.get(key) for key in ("id","exact_method_valid","analysis_scope","representation_uncertainty_mm","collision_clearance_guard_required")} for o in assembly["instances"]]
+    fingerprint=hashlib.sha256(json.dumps({"sources":[assembly["source"]["sha256"]]+[t["source"]["sha256"] for t in templates],"units":[u["occurrence_ids"] for u in units],"settings":SETTINGS,"matching_version":MATCHING_VERSION,"repair_version":REPAIR_VERSION,"calibration_policy":EXACT_CALIBRATION_POLICY,"repair_evidence":repair_evidence,"repair_results":[o.get("repair",{}).get("status") for o in assembly["instances"]]},sort_keys=True).encode()).hexdigest()
     result={"id":"model_"+fingerprint[:16],"fingerprint":fingerprint,"algorithm_version":ALGORITHM_VERSION,"matching_version":MATCHING_VERSION,"repair_version":REPAIR_VERSION,
-        "source":assembly["source"],"part_sources":[t["source"] for t in templates],"occurrences":assembly["instances"],"units":units,
+        "calibration_policy":dict(EXACT_CALIBRATION_POLICY),"analysis_policy_version":REPAIR_VERSION,"source":assembly["source"],"part_sources":[t["source"] for t in templates],"occurrences":assembly["instances"],"units":units,
         "definitions":assembly["definitions"],"nodes":assembly["nodes"],"reference_geometry":assembly["reference_geometry"],
         "scene_path":assembly["scene_path"],"bbox":assembly["bbox"],"quality":quality,"diagnostics":diagnostics,
         "metrics":assembly["metrics"],"coordinate_system":"RH_Z_UP_MM","transfer_report":assembly["transfer_report"]}

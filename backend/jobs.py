@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from .domain import DomainError, digest, geometry_hash, model_hash, now, uid
@@ -97,7 +98,7 @@ class JobService:
 
     def _run(self, job, folder):
         cancel=self.cancel_events[job["id"]]
-        guard=self.cad_lock if job["kind"] in ("import","generate","validate") else threading.Lock()
+        guard=self.cad_lock if job["kind"] in ("import","generate","validate","verify_matching","process_suggestions") else threading.Lock()
         process=None
         try:
             with guard:
@@ -138,7 +139,12 @@ class JobService:
                 job.update(status="succeeded",progress=100,message=published.get("message","작업 완료"),
                            result=published,finished_at=now())
         except InterruptedError as exc:job.update(status="canceled",message=str(exc),finished_at=now())
-        except Exception as exc:job.update(status="failed",message=str(exc),error_code=getattr(exc,"code",type(exc).__name__),finished_at=now())
+        except Exception as exc:
+            diagnostic_path=folder/'publication-error.log'
+            try:diagnostic_path.write_text(traceback.format_exc(),encoding='utf-8')
+            except OSError:pass
+            job.update(status="failed",message=str(exc),error_code=getattr(exc,"code",type(exc).__name__),finished_at=now(),
+                error_details=getattr(exc,'details',{}),publication_diagnostic='@data/'+diagnostic_path.relative_to(self.root).as_posix())
         finally:
             self.processes.pop(job["id"],None)
             self.storage.save_job(job)

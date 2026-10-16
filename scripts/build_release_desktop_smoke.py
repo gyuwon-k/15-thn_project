@@ -1,8 +1,10 @@
 """Launch the packaged desktop twice and prove its immutable payload stays intact."""
 from pathlib import Path
 import argparse
+import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -20,6 +22,8 @@ def main():
     parser.add_argument("package", type=Path)
     parser.add_argument("--data", type=Path)
     parser.add_argument("--model", action="store_true", help="Exercise the packaged Electron WebGL view and simulation before restart")
+    parser.add_argument("--review-plan", action="store_true", help="Check the supplied HVJB review plan's 55 cards and blocked second-step playback")
+    parser.add_argument("--expected-trace-sha256", help="Download the search trace from the real desktop link and check this expected SHA-256")
     args = parser.parse_args()
     package = args.package.resolve()
     releases = [p for p in (package / "releases").iterdir() if p.is_dir()]
@@ -71,9 +75,30 @@ def main():
                 play = page.get_by_role("button", name="재생", exact=True)
                 play.click(timeout=60000)
                 page.wait_for_timeout(1800)
+                review_evidence = None
+                if args.review_plan:
+                    assert page.locator(".sequence-card").count() == 55
+                    assert "검증 경로 1/55단계" in page.locator("body").inner_text()
+                    page.locator(".sequence-card").nth(1).click()
+                    page.get_by_text("이 단계는 재생이 보류되었습니다. 완성 위치에서 부품과 진단을 확인해 주세요.", exact=True).wait_for(timeout=10000)
+                    assert page.get_by_role("button", name="일시정지", exact=True).count() == 0
+                    assert "검증된 경로 재생" not in page.locator(".scene-selection").inner_text()
+                    review_evidence = {"cards": 55, "verified_prefix": 1, "blocked_second_step_returns_to_static_inspection": True}
                 screenshot = folder / "packaged-electron-model.png"
                 page.screenshot(path=str(screenshot), full_page=True)
                 model_evidence = {"screenshot": str(screenshot), "canvas_count": page.locator("canvas").count(), "sequence_cards": page.locator(".sequence-card").count(), "javascript_errors": errors, "simulation_played": True}
+                if review_evidence is not None: model_evidence["review_plan"] = review_evidence
+                if args.expected_trace_sha256:
+                    page.locator('.diagnostics-panel summary').click()
+                    link=page.get_by_role('link',name=re.compile('전체 탐색 기록 내려받기'))
+                    with page.expect_download(timeout=120000) as download_info:
+                        link.click()
+                    downloaded=folder/'downloaded-search-attempts.json'
+                    download_info.value.save_as(str(downloaded))
+                    trace_bytes=downloaded.read_bytes();digest=hashlib.sha256(trace_bytes).hexdigest()
+                    assert digest==args.expected_trace_sha256
+                    trace=json.loads(trace_bytes)
+                    model_evidence['search_trace_download']={'sha256':digest,'attempt_count':len(trace['attempts']),'bytes':len(trace_bytes),'download_link_verified':True}
                 assert not errors
                 page.close()
                 process.wait(40)

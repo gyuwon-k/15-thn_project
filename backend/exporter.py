@@ -7,11 +7,16 @@ import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlencode
-from .domain import digest, now, uid
+from .domain import digest, now, uid, playback_summary, geometry_hash
 from .jobs import atomic_json
 
 
 def render_video(payload, folder, progress, cancel, *, data_dir, build_id):
+    state=payload["render"]["snapshot"]
+    playback=playback_summary(state.get("plan",{}).get("steps",[]))
+    proof=state.get("validation") or {}
+    if not playback["total_count"] or playback["executable_prefix_count"]!=playback["total_count"] or proof.get("dependency_hash")!=geometry_hash(state) or proof.get("build_id")!=build_id:
+        raise ValueError("현재 버전에서 검증하지 않은 경로는 검토용 영상에서도 재생할 수 없습니다.")
     from playwright.sync_api import sync_playwright
     import imageio_ffmpeg
     root=Path(getattr(sys,"_MEIPASS",Path(__file__).resolve().parents[1]))

@@ -3,8 +3,8 @@
 *.md text eol=lf
 *.json text eol=lf
 *.tsx text eol=lf
+*.ts text eol=lf
 *.cjs text eol=lf
 *.ps1 text eol=crlf
 *.ttf binary
 *.png binary
-*.mp4 binary

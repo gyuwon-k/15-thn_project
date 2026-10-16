@@ -20,7 +20,7 @@ def main():
     destination.mkdir(parents=True, exist_ok=True)
     step = destination / "known-three-solids.step"
     writer = STEPControl_Writer()
-    for origin, lengths in [((0, 0, 0), (120, 80, 5)), ((10, 10, 12), (30, 20, 5)), ((60, 10, 12), (20, 20, 8))]:
+    for origin, lengths in [((0, 0, 0), (120, 80, 5)), ((10, 10, 5), (30, 20, 5)), ((60, 10, 5), (20, 20, 8))]:
         writer.Transfer(BRepPrimAPI_MakeBox(gp_Pnt(*origin), *lengths).Shape(), STEPControl_AsIs)
     writer.Write(str(step))
     manifest = load_manifest(executable.parent / "_internal")

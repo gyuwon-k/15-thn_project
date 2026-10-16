@@ -16,7 +16,7 @@ build/
 work/
 .test-cache/
 packaging/resources/
-# Company CAD, databases and local backups are registered separately.
+# Original CAD, local data and installer archives are distributed separately.
 *.step
 *.stp
 *.STEP

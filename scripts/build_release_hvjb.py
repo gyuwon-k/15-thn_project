@@ -20,20 +20,24 @@ from backend.storage import Storage
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", type=Path, required=True)
+    parser.add_argument("--backend", type=Path)
+    parser.add_argument("--development", action="store_true")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--application-smoke", action="store_true", help="Use the clearly labelled synthetic STEP to test confirmation, MP4, and revalidation")
+    parser.add_argument("--storage-synth", action="store_true", help="Fresh HVJB_SYNTH_S01 import/generate and search artifact storage regression")
     parser.add_argument("--max-seconds", type=int, default=120)
+    parser.add_argument("--user-process", action="store_true")
     parser.add_argument("--backup-output", type=Path)
     args = parser.parse_args()
     if not args.application_smoke and args.source is None:
         parser.error("--source is required for the supplied-product workflow")
-    executable = args.backend.resolve()
-    manifest = load_manifest(executable.parent / "_internal")
-    sealed_release = executable.parent.parent
+    if not args.backend and not args.development:parser.error("--backend or --development is required")
+    executable = Path(sys.executable) if args.development else args.backend.resolve()
+    manifest = load_manifest(ROOT if args.development else executable.parent / "_internal")
+    sealed_release = ROOT / "work" / "unsealed-development" if args.development else executable.parent.parent
     if (sealed_release / "release.json").is_file():
         verify_release(sealed_release)
-    folder = ROOT / "work" / ("frozen-application" if args.application_smoke else "frozen-hvjb") / uuid.uuid4().hex
+    folder = ROOT / "work" / ("frozen-application" if args.application_smoke else "frozen-synth-storage" if args.storage_synth else "frozen-hvjb") / uuid.uuid4().hex
     folder.mkdir(parents=True)
     token = uuid.uuid4().hex + uuid.uuid4().hex
     with socket.socket() as reservation:
@@ -44,13 +48,15 @@ def main():
     for variable in ("PILOT_RESOURCE_DIR", "PILOT_RELEASE_ROOT", "PILOT_MARIADB_ROOT", "PILOT_PARENT_PID", "PLAYWRIGHT_BROWSERS_PATH", "IMAGEIO_FFMPEG_EXE"):
         environment.pop(variable, None)
     environment.update(PILOT_DATA_DIR=str(folder / "data"), PILOT_SESSION_TOKEN=token, PILOT_PORT=str(port), PILOT_BUILD_ID=manifest["build_id"], PYTHONUTF8="1")
+    if args.development:environment["PILOT_RESOURCE_DIR"]=str(ROOT/"packaging"/"resources")
     output = folder / "workflow-result.json"
     def api(path, post=False):
         request = urllib.request.Request(url + "/api" + path, data=b"{}" if post else None, headers={"X-Pilot-Token": token, "Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=180 if post else 5) as response:
             return json.loads(response.read())
     with (folder / "backend.log").open("wb") as log:
-        process = subprocess.Popen([str(executable), "--server"], env=environment, stdout=log, stderr=subprocess.STDOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        command=[str(executable),"-X","utf8","-m","backend.main"] if args.development else [str(executable), "--server"]
+        process = subprocess.Popen(command, cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         try:
             deadline = time.monotonic() + 90
             while True:
@@ -66,10 +72,11 @@ def main():
                         raise RuntimeError("FROZEN_BACKEND_START_TIMEOUT")
                     time.sleep(.25)
             print(json.dumps({"build_id": manifest["build_id"], "report": str(output)}, ensure_ascii=False), flush=True)
-            workflow = "verify_application_workflow.py" if args.application_smoke else "verify_hvjb_workflow.py"
+            workflow = "verify_application_workflow.py" if args.application_smoke else "verify_synth_storage_workflow.py" if args.storage_synth else "verify_hvjb_workflow.py"
             arguments = [sys.executable, "-X", "utf8", str(ROOT / "scripts" / workflow), "--url", url, "--report", str(output)]
             if not args.application_smoke:
                 arguments += ["--source", str(args.source.resolve()), "--max-seconds", str(args.max_seconds)]
+                if args.user_process:arguments.append("--user-process")
             result = subprocess.run(arguments, env=environment, timeout=5000)
             if result.returncode == 0 and args.backup_output:
                 report = json.loads(output.read_text(encoding="utf-8"))
@@ -91,7 +98,8 @@ def main():
             if result.returncode == 0:
                 report = json.loads(output.read_text(encoding="utf-8"))
                 try:
-                    runtime = prepare_browser_runtime(executable.parent / "_internal" / "browsers", folder / "data", manifest["build_id"])
+                    browser_source=ROOT/"packaging"/"resources"/"browsers" if args.development else executable.parent / "_internal" / "browsers"
+                    runtime = prepare_browser_runtime(browser_source, folder / "data", manifest["build_id"])
                     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(runtime)
                     browser_log = folder / "browser-smoke.log"
                     os.environ["CHROME_LOG_FILE"] = str(browser_log)

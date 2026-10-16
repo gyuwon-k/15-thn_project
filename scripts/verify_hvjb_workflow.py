@@ -4,9 +4,11 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 import httpx
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 
 def main():
@@ -17,6 +19,7 @@ def main():
     parser.add_argument("--project-id")
     parser.add_argument("--max-seconds",type=int,default=120)
     parser.add_argument("--require-pass",action="store_true")
+    parser.add_argument("--user-process",action="store_true")
     options=parser.parse_args()
     client=httpx.Client(base_url=options.url,headers={"X-Pilot-Token":os.environ["PILOT_SESSION_TOKEN"]},timeout=180)
     report={"started_at":time.time(),"health":client.get("/api/health").raise_for_status().json(),"checks":[]}
@@ -60,7 +63,7 @@ def main():
         report["project_id"]=project["id"];save()
         project=get("/api/projects/"+project["id"])
         model=project["model"]
-        report["model"]={"occurrences":len(model["occurrences"]),"units":len(model["units"]),"quality":model["quality"],"diagnostics":model["diagnostics"]}
+        report["model"]={"occurrences":len(model["occurrences"]),"units":len(model["units"]),"quality":model["quality"],"diagnostics":model["diagnostics"],"matching_audit":model.get("matching_audit"),"processing_versions":model.get("processing_versions")}
         members=[x for u in model["units"] for x in u["occurrence_ids"]]
         assert len(members)==len(set(members))==len(model["occurrences"])==78
         report["checks"].append("78 physical occurrences partitioned exactly once")
@@ -68,7 +71,15 @@ def main():
         assert len(scene["meshes"])==78
         assert all(m["positions"] and m["indices"] for m in scene["meshes"])
         report["checks"].append("All 78 occurrence meshes returned by actual API")
-        response=client.patch("/api/projects/"+project["id"],json={"expected_revision":project["revision"],"rules":{"max_seconds":options.max_seconds}})
+        rules={"max_seconds":options.max_seconds}
+        if options.user_process:
+            wait(post("/api/projects/"+project["id"]+"/process-suggestions",{"expected_revision":project["revision"]}))
+            profile=get("/api/projects/"+project["id"]+"/process-suggestions")
+            assert profile["profile"]=="provided_hvjb_user_intent"
+            rules.update({key:profile[key] for key in ("process_groups","process_policy","precedence")})
+            report["process_profile"]=profile
+            report["checks"].append("User housing→plate→relay order and fixing groups loaded; uncertain assignments remain review")
+        response=client.patch("/api/projects/"+project["id"],json={"expected_revision":project["revision"],"rules":rules})
         if response.is_error:raise RuntimeError(response.text)
         project=response.json()
         wait(post("/api/projects/"+project["id"]+"/generate",{"expected_revision":project["revision"]}))
@@ -79,6 +90,16 @@ def main():
         assert report["sequence_generated"],"No full-coverage sequence generated"
         assert len({s["unit_id"] for s in project["plan"]["steps"]})==len(project["plan"]["steps"])
         report["checks"].append("Every moving assembly unit appears exactly once")
+        from backend.domain import executable_step,playback_summary
+        playback=playback_summary(project["plan"]["steps"])
+        assert project["plan"]["playback"]["executable_prefix_count"]==playback["executable_prefix_count"]
+        for index,step in enumerate(project["plan"]["steps"]):
+            if index<playback["executable_prefix_count"]:assert executable_step(step)
+            else:
+                assert step.get("executable") is not True
+                assert step.get("path") is None
+        report["checks"].append("Only contiguous verified prefix has executable paths; remaining steps have no animation path")
+        report["safe_playback"]=playback
         if not report["verified_recommendation"]:
             rejected=client.post("/api/projects/"+project["id"]+"/confirm",json={"expected_revision":project["revision"]})
             assert rejected.status_code==422

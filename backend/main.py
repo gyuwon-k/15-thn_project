@@ -10,6 +10,7 @@ import secrets
 import shutil
 import sys
 import threading
+from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -18,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from . import domain
 from .domain import DomainError, digest, now, uid
 from .jobs import JobService, atomic_json, path_values
-from .storage import Storage, StorageConflict
+from .storage import Storage, StorageConflict, StorageError
 
 PROJECT_ROOT=Path(__file__).resolve().parents[1]
 RESOURCE_ROOT=Path(getattr(sys,"_MEIPASS",PROJECT_ROOT))
@@ -75,6 +76,9 @@ class Services:
     def project(self,ident):
         result=self.store.get_project(ident)
         if result is None:raise KeyError(ident)
+        from .planning_settings import compatible_rules
+        result['rules'],notes=compatible_rules(result.get('rules',{}))
+        if notes:result['rules_compatibility']=notes
         return result
 
     def aggregate(self,ident):
@@ -85,12 +89,25 @@ class Services:
         result["jobs"]=self.store.list_jobs(ident)
         result["history_count"]=len(confirmations)
         result["coverage"]=domain.coverage(result)
+        result["model_reprocess_required"]=bool(result.get("model")) and not self.model_current(result["model"])
+        result["process_profile_hash"]=domain.process_profile_hash(result)
         result["can_confirm"]=not domain.confirmation_errors(result,self.release) and not any(j.get("status") in ("queued","running","cancel_requested") for j in result["jobs"])
-        if current:
+        validation=result.get("validation") or {}
+        current_proof=validation.get("build_id")==self.release["build_id"] and validation.get("algorithm_version")==self.release.get("algorithm_version") and validation.get("dependency_hash")==domain.geometry_hash(result)
+        if not current_proof:
+            for step in result.get("plan",{}).get("steps",[]):
+                step["executable"]=False
+            result["plan"]["revalidation_required"]=bool(result["plan"].get("steps"))
+        result["plan"]["playback"]=domain.playback_summary(result["plan"].get("steps",[]))
+        if current and current_proof:
             result["confirmed_snapshot_id"]=current["id"]
             result["plan"]["status"]="CONFIRMED"
             result["status"]="CONFIRMED";result["can_confirm"]=False
         return result
+
+    def model_current(self,model):
+        versions=model.get("processing_versions") or {}
+        return all(versions.get(key)==self.release.get(key) for key in ("preprocess_version","matching_version","geometry_backend_version"))
 
     def preserve_model(self,model,project_id):
         """Publish every referenced shape/scene before linking the new model."""
@@ -102,15 +119,38 @@ class Services:
             if isinstance(value,str):
                 try:
                     path=Path(value)
-                    if path.is_absolute() and path.is_file() and path.resolve().is_relative_to(self.root):
-                        key=str(path.resolve())
-                        if key not in published:
-                            asset=self.store.register_file(path,"model_artifact",project_id)
-                            published[key]=str(self.store.file_path(asset["id"]))
-                        return published[key]
-                except (ValueError,OSError):pass
+                    managed=path.is_absolute() and path.is_file() and path.resolve().is_relative_to(self.root)
+                except (ValueError,OSError):managed=False
+                if managed:
+                    key=str(path.resolve())
+                    if key not in published:
+                        # Publication failures must abort the project update;
+                        # never fall back to linking an unregistered cache file.
+                        asset=self.store.register_file(path,"model_artifact",project_id)
+                        published[key]=str(self.store.file_path(asset["id"]))
+                    return published[key]
             return value
         return path_values(visit(model),self.root,encode=True)
+
+    def preserve_search_trace(self, plan, job):
+        """Publish complete search evidence before saving a compact plan row."""
+        attempts = plan.get('attempt_trace')
+        if not isinstance(attempts, list):
+            return
+        path = self.root / 'jobs' / job['id'] / 'search-attempts.json'
+        atomic_json(path, {'format': 'pilot-search-attempts/1', 'job_id': job['id'],
+            'project_id': job['project_id'], 'build_id': self.release['build_id'],
+            'geometry_hash': job['geometry_hash'], 'model_hash': job.get('model_hash'),
+            'algorithm_version': plan.get('algorithm_version'), 'attempts': attempts})
+        asset = self.store.register_file(path, 'search_trace', job['project_id'])
+        # File copy/hash and relational registration must succeed first. A
+        # failure leaves the previous project revision and worker result intact.
+        plan['attempt_trace_artifact'] = {'format': 'pilot-search-attempts/1',
+            'file_id': asset['id'], 'sha256': asset['sha256'], 'size': asset['size'],
+            'count': len(attempts), 'url': '/api/files/' + asset['id']}
+        plan['attempt_trace_summary'] = {'count': len(attempts),
+            'status_counts': dict(Counter(row.get('status', 'UNKNOWN') for row in attempts))}
+        del plan['attempt_trace']
 
     def apply_result(self,job,result):
         with self.lock:
@@ -119,6 +159,11 @@ class Services:
                 if project["revision"]!=job["input_revision"]:
                     raise DomainError("STALE_RESULT","가져오기 중 프로젝트가 변경되어 결과를 자동 적용하지 않았습니다.")
                 model=self.preserve_model(result,project["id"])
+                if project.get("model"):
+                    archived=self.root/"snapshots"/(uid("before-reprocess-")+".json")
+                    atomic_json(archived,project)
+                    asset=self.store.register_file(archived,"preprocessing_history",project["id"])
+                    self.store.append_event(project["id"],"model_replaced",{"file_id":asset["id"],"previous_revision":project["revision"],"message":"모델 교체 전 원본·작업·규칙·순서 보존"})
                 project["source_files"]=job.get("source_files",[])
                 model["part_files"]=[a for a in project["source_files"] if a["role"]=="part_step"]
                 project["model"]=model
@@ -129,14 +174,63 @@ class Services:
                 project["rules"]["contact_policies"]=[]
                 project["rules"]["initial_obstacle_ids"]=[]
                 project["rules"].pop("geometry_review",None)
+                for key in ("entry_conditions","process_groups","process_policy"):
+                    project["rules"].pop(key,None)
                 project["plan"]={"id":uid("plan-"),"revision":1,"steps":[],"status":"EMPTY"}
+                project.pop('generation_report',None)
                 project["validation"]=None;project["status"]="MODEL_READY"
                 message=f"STEP 처리 완료 · {len(model.get('occurrences',[]))}개 배치 · {len(units)}개 조립 단위"
+            elif kind=="verify_matching":
+                if project["revision"]!=job["input_revision"]:raise DomainError("STALE_RESULT","대응 검사 중 작업이 변경되어 결과를 적용하지 않았습니다.")
+                checks={row["unit_id"]:row["matching"] for row in result["unit_results"]}
+                for unit in project["model"]["units"]:
+                    if unit["id"] in checks:unit["matching"]=checks[unit["id"]]
+                domain.refresh_matching_quality(project["model"])
+                project["model"]["diagnostics"]=[d for d in project["model"].get("diagnostics",[]) if not (d.get("code")=="MATCH_GEOMETRY_REVIEW" and d.get("unit_id") in checks)]+result.get("diagnostics",[])
+                project["validation"]=None
+                project["plan"]["status"]="NEEDS_VALIDATION"
+                for step in project["plan"].get("steps",[]):step.update(status="UNKNOWN",executable=False,planning_state="UNPLANNED",path=None,reason="EDIT_REQUIRES_VALIDATION")
+                project["plan"]["playback"]=domain.playback_summary(project["plan"].get("steps",[]))
+                project["status"]="REVIEW_REQUIRED"
+                message="실제 형상 대응 검사 완료 · 순서 재검증 필요"
+            elif kind=="process_suggestions":
+                if domain.model_hash(project)!=job["model_hash"]:raise DomainError("STALE_RESULT","모델이 변경되어 체결품 후보를 다시 검사해야 합니다.")
+                if domain.process_profile_hash(project)!=result.get("dependency_hash"):raise DomainError("STALE_RESULT","고정품 또는 부품 정보가 변경되어 체결품 후보를 다시 검사해야 합니다.")
+                result["dependency_hash"]=domain.process_profile_hash(project)
+                self.store.set_setting("process_suggestions:"+project["id"],result)
+                return {"message":"체결품 후보 검사 완료 · 고정 대상과 순서를 확인하세요.","project_id":project["id"]}
             elif kind in ("generate","validate"):
                 if domain.geometry_hash(project)!=job["geometry_hash"]:
                     raise DomainError("STALE_RESULT","계산 중 조건이 변경되어 이전 결과를 적용하지 않았습니다.")
+                analysis_changed=False
+                if result.get('analysis_model') is not None:
+                    updated=copy.deepcopy(result['analysis_model'])
+                    # Work labels may change while geometry is being checked.
+                    # Keep the current unit metadata; only analysis readiness
+                    # comes from the worker's replacement representation.
+                    readiness={unit['id']:unit.get('collision_ready',False) for unit in updated.get('units',[])}
+                    updated['units']=[{**unit,'collision_ready':readiness.get(unit['id'],False)}
+                        for unit in project['model'].get('units',[])]
+                    project['model']=self.preserve_model(updated,project['id'])
+                    analysis_changed=True
+                    project['validation']=None
+                    project['plan']['status']='NEEDS_VALIDATION'
+                    project['status']='REVIEW_REQUIRED'
+                    project.pop('confirmed_snapshot_id',None)
+                    for step in project['plan'].get('steps',[]):
+                        step.update(status='UNKNOWN',executable=False,planning_state='UNPLANNED',path=None,
+                                    reason='ANALYSIS_MODEL_CHANGED')
+                    project['plan']['playback']=domain.playback_summary(project['plan'].get('steps',[]))
                 if kind=="generate":
                     plan=result["plan"];plan.setdefault("id",uid("plan-"));plan["revision"]=project["plan"].get("revision",0)+1
+                    self.preserve_search_trace(plan, job)
+                    project['generation_report']={key:copy.deepcopy(plan[key]) for key in ('status','kind','generation_method','diagnostics','placement_audit','disassembly','search','timing','attempt_trace_artifact','attempt_trace_summary','learning_eligibility') if key in plan}
+                    if result.get('analysis_refresh'):project['generation_report']['analysis_refresh']=copy.deepcopy(result['analysis_refresh'])
+                    if plan.get('replace_plan') is False:
+                        project['revision']+=1
+                        saved=self.store.save_project(project,project['row_version'],{'kind':'generation_incomplete','job_id':job['id'],'message':'분해 탐색 미완료 · 기존 조립 계획 보존'})
+                        return {'project_id':project['id'],'revision':saved['revision'],'status':'INCOMPLETE',
+                            'message':f"분해 탐색 미완료 · {plan.get('disassembly',{}).get('removed_count',0)}개 제거 경로 확인 · 기존 계획 보존"+(' · 형상 갱신으로 재검증 필요' if analysis_changed else '')}
                     unit_map={u["id"]:u for u in project["model"].get("units",[])}
                     for step in plan.get("steps",[]):
                         step.setdefault("id",uid("step-"));step.setdefault("name",unit_map.get(step.get("unit_id"),{}).get("name","조립"))
@@ -152,8 +246,9 @@ class Services:
                     for step in project["plan"].get("steps",[]):
                         checked=checks.get(step["id"])
                         if checked:
-                            for key in ("path","status","diagnostics"):
+                            for key in ("path","status","diagnostics","executable","planning_state","reason","proposed_entry","rejected_candidate_summary","process_diagnostic","support_diagnostic","support_evidence"):
                                 if key in checked:step[key]=checked[key]
+                project["plan"]["playback"]=domain.playback_summary(project["plan"].get("steps",[]))
                 validation.update(id=uid("validation-"),dependency_hash=domain.geometry_hash(project),validated_at=now(),
                                   build_id=self.release["build_id"],algorithm_version=self.release.get("algorithm_version"))
                 if not domain.coverage(project)["complete"] and validation.get("status")=="PASS":
@@ -161,7 +256,8 @@ class Services:
                 project["validation"]=validation
                 project["plan"]["status"]="PASS" if validation.get("status")=="PASS" else "DRAFT"
                 project["status"]="VALIDATED" if validation.get("status")=="PASS" else "REVIEW_REQUIRED"
-                message=("조립순서 생성·검증 통과" if kind=="generate" else "조립성 검증 통과") if validation.get("status")=="PASS" else "검토용 순서와 진단 생성 · 확정 전 검토 필요"
+                playable=project["plan"]["playback"]["executable_prefix_count"]
+                message=("조립순서 생성·검증 통과" if kind=="generate" else "조립성 검증 통과") if validation.get("status")=="PASS" else f"검증 경로 {playable}단계 · 나머지 단계는 진단 확인 후 재검증 필요"
             elif kind=="export":
                 path=Path(path_values(result["video_path"],self.root))
                 asset=self.store.register_file(path,"video",project["id"])
@@ -224,6 +320,10 @@ def create_app(data_dir=None,resources=None):
                             content={"detail":str(exc),"code":exc.code,"details":exc.details})
     @app.exception_handler(StorageConflict)
     async def conflict(_,exc):return JSONResponse(status_code=409,content={"detail":str(exc),"current":exc.current})
+    @app.exception_handler(StorageError)
+    async def storage_error(_,exc):
+        return JSONResponse(status_code=413 if exc.code=='STORAGE_PAYLOAD_TOO_LARGE' else 503,
+            content={'detail':str(exc),'code':exc.code,'details':exc.details})
     @app.exception_handler(KeyError)
     async def missing(_,exc):return JSONResponse(status_code=404,content={"detail":"항목을 찾을 수 없습니다.","id":str(exc)})
 
@@ -247,7 +347,7 @@ def create_app(data_dir=None,resources=None):
         with svc.lock:
             old=svc.project(ident);project=domain.patch_project(old,body)
             result=svc.store.save_project(project,old["row_version"],{"kind":"user_edit","before_geometry_hash":domain.geometry_hash(old),"after_geometry_hash":domain.geometry_hash(project),"before_steps":[s["id"] for s in old["plan"].get("steps",[])],"after_steps":[s["id"] for s in project["plan"].get("steps",[])]})
-        return result
+        return svc.aggregate(result["id"])
 
     async def receive(upload,folder):
         filename=(upload.filename or "model.step").replace("\\","/").rsplit("/",1)[-1]
@@ -266,6 +366,8 @@ def create_app(data_dir=None,resources=None):
     @app.post("/api/projects/{ident}/import")
     async def import_files(ident:str,assembly:UploadFile=File(...),parts:list[UploadFile]=File(default=[]),expected_revision:int=Form(...)):
         svc=service();project=svc.project(ident);domain.expect(project,expected_revision)
+        names=[(part.filename or "model.step").replace("\\","/").rsplit("/",1)[-1].casefold() for part in parts]
+        if len(names)!=len(set(names)):raise DomainError("DUPLICATE_PART_FILENAME","부품 파일 이름이 중복됩니다. 각 부품을 구분할 수 있도록 파일 이름을 다르게 지정해 주세요.")
         folder=svc.root/"inputs"/uid("input-")
         assembly_path=await receive(assembly,folder/"assembly")
         part_paths=[await receive(part,folder/("part-"+str(index))) for index,part in enumerate(parts)]
@@ -285,17 +387,67 @@ def create_app(data_dir=None,resources=None):
         if not path:raise DomainError("SCENE_NOT_READY","표시 모델이 아직 준비되지 않았습니다.")
         return FileResponse(path_values(path,svc.root),media_type="application/json")
 
+    @app.post("/api/projects/{ident}/reprocess")
+    def reprocess(ident:str,body:dict=Body(...)):
+        svc=service()
+        with svc.lock:
+            project=svc.project(ident);domain.expect(project,body.get("expected_revision"))
+            sources=project.get("source_files") or []
+            assemblies=[s for s in sources if s.get("role")=="assembly_step"]
+            if len(assemblies)!=1:raise DomainError("SOURCE_REQUIRED","보관된 완제품 원본을 찾을 수 없습니다. STEP을 다시 등록해 주세요.")
+            folder=svc.root/"inputs"/uid("reprocess-")
+            assembly_path=None;part_paths=[]
+            for index,source in enumerate(sources):
+                if source.get("role") not in ("assembly_step","part_step"):continue
+                original=svc.store.file_path(source["id"],verify=True)
+                name=source.get("original_name") or source.get("name") or original.name
+                name=Path(str(name).replace("\\","/")).name
+                target=folder/str(index)/name;target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(original,target)
+                if source["role"]=="assembly_step":assembly_path=str(target)
+                else:part_paths.append(str(target))
+            return svc.jobs.submit(project,"import",{"assembly_path":assembly_path,"part_paths":part_paths,"source_files":sources,"cache_dir":str(svc.root/"cache"/uid()),"timeout_seconds":3600})
+
     def computation(ident,kind,body):
         svc=service();project=svc.project(ident);domain.expect(project,body.get("expected_revision"))
         if not project.get("model"):raise DomainError("MODEL_REQUIRED","먼저 STEP을 등록해 주세요.")
+        if not svc.model_current(project["model"]):raise DomainError("MODEL_REPROCESS_REQUIRED","새 전처리·형상 대조 기준을 적용하려면 보관된 원본으로 모델을 재처리해 주세요.")
         domain.check_rules(project["model"],project["rules"])
         active=next((m for m in svc.store.get_setting("learning_models",[]) if m.get("active")),None)
         if active and project.get("part_number") not in active.get("supported_part_numbers",[]):active=None
-        return svc.jobs.submit(project,kind,{"project":project,"ranking_model":active,"cache_dir":str(svc.root/"analysis"/ident),"timeout_seconds":max(120,project["rules"].get("max_seconds",300)*3+60)},body.get("request_id"))
+        from .planning_settings import analysis_job_timeout
+        return svc.jobs.submit(project,kind,{"project":project,"ranking_model":active,"cache_dir":str(svc.root/"analysis"/ident),"timeout_seconds":analysis_job_timeout(project['rules'],kind)},body.get("request_id"))
     @app.post("/api/projects/{ident}/generate")
     def generate(ident:str,body:dict=Body(...)):return computation(ident,"generate",body)
     @app.post("/api/projects/{ident}/validate")
     def validate(ident:str,body:dict=Body(...)):return computation(ident,"validate",body)
+    @app.post("/api/projects/{ident}/verify-matching")
+    def verify_matching(ident:str,body:dict=Body(...)):
+        svc=service();project=svc.project(ident);domain.expect(project,body.get("expected_revision"))
+        if not project.get("model"):raise DomainError("MODEL_REQUIRED","먼저 STEP을 등록해 주세요.")
+        if not svc.model_current(project["model"]):raise DomainError("MODEL_REPROCESS_REQUIRED","새 검사 기준으로 원본 모델을 먼저 재처리해 주세요.")
+        ids=body.get("unit_ids")
+        if ids is not None and (not isinstance(ids,list) or not ids or any(not isinstance(i,str) for i in ids) or len(ids)!=len(set(ids)) or not set(ids)<={u["id"] for u in project["model"]["units"]}):
+            raise DomainError("INVALID_MATCHING_SCOPE","검사할 실제 조립 단위를 하나 이상 선택해 주세요.")
+        return svc.jobs.submit(project,"verify_matching",{"model":project["model"],"unit_ids":body.get("unit_ids"),"cache_dir":str(svc.root/"matching"/uid()),"timeout_seconds":3600})
+
+    @app.get("/api/projects/{ident}/process-suggestions")
+    def process_suggestions(ident:str):
+        project=service().project(ident)
+        if not project.get("model"):raise DomainError("MODEL_REQUIRED","먼저 STEP을 등록해 주세요.")
+        result=service().store.get_setting("process_suggestions:"+ident)
+        if not result or result.get("dependency_hash")!=domain.process_profile_hash(project):raise DomainError("PROCESS_CANDIDATES_REQUIRED","현재 부품 대응·고정 기준으로 체결품 후보 검사를 먼저 실행해 주세요.")
+        return result
+
+    @app.post("/api/projects/{ident}/process-suggestions")
+    def start_process_suggestions(ident:str,body:dict=Body(...)):
+        svc=service();project=svc.project(ident);domain.expect(project,body.get("expected_revision"))
+        if not project.get("model"):raise DomainError("MODEL_REQUIRED","먼저 STEP을 등록해 주세요.")
+        if not svc.model_current(project["model"]):raise DomainError("MODEL_REPROCESS_REQUIRED","새 검사 기준으로 원본 모델을 먼저 재처리해 주세요.")
+        model=copy.deepcopy(project["model"])
+        fixed=set(project["rules"].get("fixed_unit_ids",[]))
+        for unit in model["units"]:unit["fixed"]=unit["id"] in fixed
+        return svc.jobs.submit(project,"process_suggestions",{"model":model,"process_profile_hash":domain.process_profile_hash(project),"timeout_seconds":360})
     @app.get("/api/jobs/{ident}")
     def job(ident:str):
         result=service().store.get_job(ident)
@@ -379,6 +531,10 @@ def create_app(data_dir=None,resources=None):
         if not draft and snapshot is None:raise DomainError("CONFIRMATION_REQUIRED","영상 출력 전 순서를 확정해 주세요.")
         state=project if draft else snapshot["project"]
         if not state.get("plan",{}).get("steps"):raise DomainError("PLAN_REQUIRED","출력할 조립순서가 없습니다.")
+        playback=domain.playback_summary(state["plan"]["steps"])
+        proof=state.get("validation") or {}
+        if playback["executable_prefix_count"]!=playback["total_count"] or proof.get("dependency_hash")!=domain.geometry_hash(state) or proof.get("build_id")!=svc.release["build_id"]:
+            raise DomainError("VERIFIED_PATHS_REQUIRED","모든 단계의 경로를 현재 버전으로 검증한 후 영상을 생성해 주세요. 보류된 단계는 영상으로 재생할 수 없습니다.")
         if "seconds_per_step" in body:raise DomainError("STEP_TIMING_REQUIRED","영상 시간은 순서 단계의 재생 시간으로 저장한 뒤 확정해 주세요.")
         settings={"width":int(body.get("width",1280)),"height":int(body.get("height",720)),"fps":int(body.get("fps",24))}
         if (settings["width"],settings["height"]) not in ((640,360),(1280,720),(1920,1080)) or settings["fps"] not in (12,24,30):

@@ -15,6 +15,7 @@ import math
 import time
 from fractions import Fraction
 import OCP
+from .exact_extrema import EXTREMA_POLICY
 from OCP.Bnd import Bnd_Box
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve
@@ -25,6 +26,7 @@ from OCP.BRepClass import BRepClass_FaceClassifier
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepLib import BRepLib
+from OCP.BRepLib import BRepLib_ValidateEdge
 from OCP.BRepTools import BRepTools
 from OCP.GeomTools import GeomTools
 from OCP.GeomLib import GeomLib_CheckCurveOnSurface
@@ -45,6 +47,19 @@ except ImportError:
 KINDS = {"solid": TopAbs_SOLID, "shell": TopAbs_SHELL, "face": TopAbs_FACE,
          "wire": TopAbs_WIRE, "edge": TopAbs_EDGE, "vertex": TopAbs_VERTEX}
 STATUS_BINDING_ERROR = None
+EXACT_CALIBRATION_POLICY = {
+    "version": "measured-unchanged-cad-2.4.0",
+    "strict_maximum_per_edge_increment_mm": 1e-4,
+    "changed_edge_tolerance_basis": "original local edge tolerance plus independently measured bounded increment",
+    "assembly_maximum_per_edge_increment_mm": 0.05,
+    "assembly_maximum_increment_fraction_of_diagonal": 0.001,
+    "assembly_minimum_increment_budget_mm": 1e-4,
+    "geometry_movement_allowed": False,
+    "native_extrema_method": "full_interval_with_independent_samples_and_bounded_complete_interval_retry",
+    "extrema_policy": dict(EXTREMA_POLICY),
+    "clearance_certification_requires_uncertainty_guard": True,
+    "nominal_scope": "No detected volume interference at the recorded CAD representation precision; manufacturing clearance is not certified.",
+}
 
 
 def _shape_volume(shape):
@@ -1205,4 +1220,167 @@ def verified_topology_repair(shape):
             return candidate, audit
     audit.update(status="blocked", reason="NO_CANDIDATE_PASSED_GEOMETRY_VALIDITY_AND_ORIGINAL_LOCAL_TOLERANCE_GATES",
                  elapsed_s=time.perf_counter() - started)
+    return None, audit
+
+
+def verified_exact_representation_repair(shape, maximum_increment_mm=1e-4, allow_coarse_calibration=False):
+    """Calibrate understated edge tolerances against measured exact residuals.
+
+    This never moves geometry or changes pcurves, parameter ranges, topology,
+    or validation settings. The strict policy limits each changed edge to its
+    own tolerance plus the fixed numerical repair allowance. Optional assembly
+    analysis calibration permits a measured per-edge increment limited to
+    max(0.0001 mm, min(0.05 mm, source bounding-box diagonal * 0.001)). An
+    existing local tolerance is retained, not treated as new damage. No
+    unrelated global tolerance lends its budget to an edge. Local uncertainty is
+    disclosed even when original metadata understated it. Clearance certification
+    requires a downstream uncertainty guard; nominal interference detection is
+    explicitly limited to the recorded CAD representation precision.
+    A vertex can inherit
+    only a directly incident changed edge's tolerance. Both standard and exact
+    OCCT checks must pass on the candidate. Larger source contradictions are
+    reported and the candidate is rejected, not silently declared valid.
+    """
+    from OCP.BRep import BRep_Builder
+    from .exact_extrema import measured_residual
+    if not math.isfinite(maximum_increment_mm) or not 0 <= maximum_increment_mm <= 1e-4:
+        raise ValueError("Exact repair increment must be between 0 and 0.0001 mm")
+    started = time.perf_counter()
+    ordinary = bool(BRepCheck_Analyzer(shape).IsValid())
+    exact = BRepCheck_Analyzer(shape, True, False, True)
+    source_tolerance = max_tolerances(shape)
+    audit = {"schema_version": 4, "operation": "exact_curve_surface_tolerance_calibration",
+             "occt_version": OCP.__version__, "source_modified": False,
+             "source_standard_valid": ordinary, "source_exact_valid": bool(exact.IsValid()),
+             "maximum_per_edge_tolerance_increment_mm": maximum_increment_mm,
+             "source_max_tolerance_mm": source_tolerance,
+             "representation_uncertainty_mm": max(source_tolerance.values()),
+             "allow_coarse_calibration": bool(allow_coarse_calibration),
+             "calibration_budget": dict(EXACT_CALIBRATION_POLICY),
+             "coarse_calibrated_edge_indices": [],
+             "geometry_changed": False, "measurements": [], "rejected_edges": [],
+             "acceptance_basis": "Unchanged full-double 3D/2D supports, trims and vertices; complete independently checked native exact extrema; local tolerance increment bounded by 0.0001 mm (strict) or max(0.0001 mm, min(0.05 mm, source diagonal * 0.001)) (assembly analysis); existing local tolerances remain disclosed; both OCCT analyzers must pass.",
+             "official_method_source": "https://github.com/Open-Cascade-SAS/OCCT/blob/V8_0_0/src/ModelingAlgorithms/TKTopAlgo/BRepLib/BRepLib_ValidateEdge.cxx",
+             "limitations": ["Tolerance calibration describes an existing representation mismatch; it does not improve the precision of the source CAD surfaces.",
+                             "Assembly clearance certification must retain the reported representation uncertainty.",
+                             EXACT_CALIBRATION_POLICY["nominal_scope"]]}
+    if audit["source_exact_valid"]:
+        audit.update(status="already_valid", elapsed_s=time.perf_counter() - started)
+        return None, audit
+    if not ordinary:
+        audit.update(status="blocked", reason="STANDARD_TOPOLOGY_REPAIR_REQUIRED_FIRST",
+                     elapsed_s=time.perf_counter() - started)
+        return None, audit
+    source_bbox = shape_bbox(shape)
+    dimensions = source_bbox["size"] if source_bbox else []
+    if len(dimensions) != 3 or not all(math.isfinite(v) and v >= 0 for v in dimensions):
+        audit.update(status="blocked", reason="NON_FINITE_SOURCE_GEOMETRY_EXTENT", elapsed_s=time.perf_counter() - started)
+        return None, audit
+    diagonal = math.hypot(*dimensions)
+    if not math.isfinite(diagonal) or diagonal <= 0:
+        audit.update(status="blocked", reason="EMPTY_SOURCE_GEOMETRY_EXTENT", elapsed_s=time.perf_counter() - started)
+        return None, audit
+    assembly_increment_budget = max(EXACT_CALIBRATION_POLICY["assembly_minimum_increment_budget_mm"],
+        min(EXACT_CALIBRATION_POLICY["assembly_maximum_per_edge_increment_mm"],
+            diagonal * EXACT_CALIBRATION_POLICY["assembly_maximum_increment_fraction_of_diagonal"]))
+    audit["calibration_budget"].update(source_diagonal_mm=diagonal,
+        evaluated_assembly_per_edge_increment_mm=assembly_increment_budget,
+        evaluated_strict_per_edge_increment_mm=maximum_increment_mm)
+    original_support = support_geometry(shape)
+    original_boundary = boundary_manifest(shape)
+    original_pcurves = pcurve_manifest(shape)
+    original_tolerances = per_entity_tolerance_hash(shape)
+    original_counts = {name: len(shapes(shape, kind)) for name, kind in KINDS.items()}
+    source_index, incident = _incident_edge_index(shape)
+    targets = {index for index, rows in incident.items()
+               if any(not exact.IsValid(face) for _, face, _ in rows)}
+    required = {}
+    for index in sorted(targets):
+        edge = TopoDS.Edge(source_index.FindKey(index))
+        if BRep_Tool.Degenerated_s(edge):
+            continue
+        old_tolerance = float(BRep_Tool.Tolerance_s(edge))
+        edge_measurements = []
+        maximum = 0.0
+        failure = None
+        for face_index, entity, oriented in incident[index]:
+            face, oriented = TopoDS.Face(entity), TopoDS.Edge(oriented)
+            try:
+                pcurve = BRep_Tool.CurveOnSurface_s(oriented, face, 0.0, 0.0)
+                measurement = measured_residual(edge, oriented, face)
+                measured = measurement["measured_mm"]
+                maximum = max(maximum, measured)
+                if not measurement["within_source_tolerance"]:
+                    edge_measurements.append({"face_index": face_index,
+                        "edge_orientation": enum_name(oriented.Orientation()),
+                        "surface_type": BRep_Tool.Surface_s(face).DynamicType().Name(),
+                        "pcurve_type": pcurve.DynamicType().Name(),
+                        "exact_residual_with_native_1_00001_margin_mm": measured,
+                        "independent_257_point_residual_lower_bound_mm": measurement["independent_sample_lower_bound_mm"],
+                        "native_full_interval_mm": measurement["native_full_interval_mm"],
+                        "complete_interval_extrema_retries": measurement["interval_retry"]})
+            except Exception as exc:
+                failure = str(exc)
+                break
+        if failure:
+            audit["rejected_edges"].append({"edge_index": index, "reason": failure})
+            continue
+        if not edge_measurements:
+            continue
+        requested = max(old_tolerance, maximum + 1e-10)
+        row = {"edge_index": index, "source_edge_tolerance_mm": old_tolerance,
+               "measured_existing_source_residual_mm": maximum,
+               "requested_edge_tolerance_mm": requested,
+               "increment_mm": requested - old_tolerance, "faces": edge_measurements}
+        audit["measurements"].append(row)
+        if requested - old_tolerance > maximum_increment_mm + 1e-12:
+            coarse_allowed = (allow_coarse_calibration and requested - old_tolerance <= assembly_increment_budget)
+            if coarse_allowed:
+                required[index] = requested
+                audit["coarse_calibrated_edge_indices"].append(index)
+            else:
+                audit["rejected_edges"].append({**row,
+                    "allowed_local_increment_mm": assembly_increment_budget if allow_coarse_calibration else maximum_increment_mm,
+                    "reason": "MEASURED_RESIDUAL_EXCEEDS_LOCAL_NUMERICAL_REPAIR_BUDGET"})
+        else:
+            required[index] = requested
+    audit["maximum_measured_source_residual_mm"] = max(
+        (row["measured_existing_source_residual_mm"] for row in audit["measurements"]), default=0.0)
+    audit["maximum_required_increment_mm"] = max((row["increment_mm"] for row in audit["measurements"]), default=0.0)
+    measurement_complete = not any("requested_edge_tolerance_mm" not in row for row in audit["rejected_edges"])
+    audit["residual_measurement_complete"] = measurement_complete
+    audit["representation_uncertainty_mm"] = max(max(source_tolerance.values()), audit["maximum_measured_source_residual_mm"]) if measurement_complete else None
+    if audit["rejected_edges"]:
+        audit.update(status="blocked", reason="EXACT_RESIDUAL_REQUIRES_SOURCE_GEOMETRY_REVIEW",
+                     elapsed_s=time.perf_counter() - started)
+        return None, audit
+    candidate = copied(shape)
+    candidate_edges = shapes(candidate, TopAbs_EDGE)
+    builder = BRep_Builder()
+    for index, tolerance in required.items():
+        edge = TopoDS.Edge(candidate_edges[index - 1])
+        if edge_key(edge) != edge_key(source_index.FindKey(index)):
+            raise ValueError("Deep-copy edge mapping changed")
+        builder.UpdateEdge(edge, tolerance)
+        for vertex in shapes(edge, TopAbs_VERTEX):
+            builder.UpdateVertex(TopoDS.Vertex(vertex), tolerance)
+    checks = {"placed_3d_supports_unchanged": original_support == support_geometry(candidate),
+              "face_wire_3d_trims_and_vertices_unchanged": original_boundary == boundary_manifest(candidate),
+              "every_original_2d_pcurve_and_range_unchanged": original_pcurves == pcurve_manifest(candidate),
+              "all_unique_topology_counts_unchanged": original_counts == {name: len(shapes(candidate, kind)) for name, kind in KINDS.items()},
+              "source_tolerances_unchanged": original_tolerances == per_entity_tolerance_hash(shape),
+              "standard_valid": bool(BRepCheck_Analyzer(candidate).IsValid()),
+              "exact_method_valid": bool(BRepCheck_Analyzer(candidate, True, False, True).IsValid())}
+    audit.update(preservation_checks=checks, changed_edge_count=len(required),
+                 source_max_tolerance_mm=max_tolerances(shape),
+                 candidate_max_tolerance_mm=max_tolerances(candidate),
+                 representation_uncertainty_mm=max(max_tolerances(candidate).values()),
+                 elapsed_s=time.perf_counter() - started)
+    if all(checks.values()):
+        coarse = bool(audit["coarse_calibrated_edge_indices"])
+        audit.update(status="accepted", accepted_method="bounded_measured_source_uncertainty_calibration" if coarse else "bounded_exact_residual_metadata_calibration",
+                     collision_clearance_guard_required=True,
+                     analysis_scope="assembly_collision_with_source_uncertainty" if coarse else "exact_occt_preserved_geometry")
+        return candidate, audit
+    audit.update(status="blocked", reason="EXACT_CANDIDATE_DID_NOT_PASS_ALL_PRESERVATION_AND_VALIDITY_GATES")
     return None, audit

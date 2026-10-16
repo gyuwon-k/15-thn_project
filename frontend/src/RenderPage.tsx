@@ -3,7 +3,7 @@ import {flushSync} from 'react-dom';
 import Scene from './Scene';
 import {api,rows,stepName,stepUnit} from './api';
 import type {Row} from './api';
-import {stageAt,timelineDuration,pathEndpoints} from './motion';
+import {stageAt,timelineDuration,isExecutableStep} from './motion';
 
 const afterPaint=()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve())));
 function torqueText(torque:any){if(torque?.not_applicable)return '해당 없음';if(torque===null||torque===undefined||torque==='')return '미입력';if(typeof torque!=='object')return String(torque);return `${torque.value??torque.text??'미입력'} ${torque.unit||''}`.trim();}
@@ -16,7 +16,7 @@ export default function RenderPage({id}:{id:string}){
  useEffect(()=>{
   const controller={ready:false,duration,error,scene_ready:ready,setTime:async(value:number)=>{
    if(!Number.isFinite(value)||value<0||value>duration+.01)throw new Error('영상 시간 범위를 벗어났습니다.');
-   if(!draft&&steps.some(item=>!pathEndpoints(item)?.stored||item.path?.verified!==true||String(item.status).toUpperCase()!=='PASS'))throw new Error('확정 영상에 저장된 검증 경로가 없는 단계가 있습니다.');
+   if(steps.some(item=>!isExecutableStep(item)))throw new Error('검증 경로가 없는 단계는 영상으로 재생할 수 없습니다.');
    flushSync(()=>setTime(Math.min(value,duration)));await document.fonts.ready;await afterPaint();
    root.current?.querySelectorAll<HTMLElement>('[data-fit]').forEach(element=>{const base=Number(element.dataset.font)||18;element.style.fontSize=base+'px';let size=base;while((element.scrollHeight>element.clientHeight+1||element.scrollWidth>element.clientWidth+1)&&size>10){size-=.5;element.style.fontSize=size+'px';}if(element.scrollHeight>element.clientHeight+2||element.scrollWidth>element.clientWidth+2)throw new Error('영상 정보가 템플릿 영역을 초과합니다. 주의사항을 나누거나 템플릿 영역을 조정해 주세요.');});
    await afterPaint();return {time:Math.min(value,duration),step_id:stageAt(steps,value)?.step.id};

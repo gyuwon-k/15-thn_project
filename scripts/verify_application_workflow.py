@@ -32,19 +32,40 @@ def main():
         from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
         from OCP.gp import gp_Pnt
         step=output.parent/"synthetic-three-solids.step";writer=STEPControl_Writer()
-        for point,size in [((0,0,0),(120,80,5)),((10,10,12),(30,20,5)),((60,10,12),(20,20,8))]:
+        for point,size in [((0,0,0),(120,80,5)),((10,10,5),(30,20,5)),((60,10,5),(20,20,8))]:
             writer.Transfer(BRepPrimAPI_MakeBox(gp_Pnt(*point),*size).Shape(),STEPControl_AsIs)
         writer.Write(str(step))
         report["release"]=request("GET","/api/health")
         project=request("POST","/api/projects",json={"name":"기능시험 · 합성 3부품 · 실제 제품 아님","part_number":"000-TEST"})
+        assert project['rules']['max_seconds']==project['rules']['validation_seconds']==1800
+        assert project['rules']['candidate_seconds']==project['rules']['native_timeout_seconds']==120
+        report['checks']['new_project_30_minute_generation_and_validation_defaults']=True
         ident=project["id"];report["project_id"]=ident;prefix="/api/projects/"+ident
         with step.open("rb") as stream:wait(request("POST",prefix+"/import",files={"assembly":(step.name,stream)},data={"expected_revision":project["revision"]}))
         project=request("GET",prefix);assert len(project["model"]["occurrences"])==3
         report["checks"]["step_import_three_occurrences"]=True
+        wait(request("POST",prefix+"/process-suggestions",json={"expected_revision":project["revision"]}))
+        proposal=request("GET",prefix+"/process-suggestions")
+        assert proposal["profile"]=="generic_geometry_candidates" and proposal["dependency_hash"]
+        unchanged=request("GET",prefix);assert unchanged["revision"]==project["revision"]
+        original_fixed=project["rules"]["fixed_unit_ids"]
+        modified=request("PATCH",prefix,json={"expected_revision":project["revision"],"rules":{"fixed_unit_ids":[project["model"]["units"][0]["id"]]}})
+        assert client.get(prefix+"/process-suggestions").status_code==422
+        project=request("PATCH",prefix,json={"expected_revision":modified["revision"],"rules":{"fixed_unit_ids":original_fixed}})
+        report["checks"]["readonly_process_proposal_invalidated_by_fixed_unit_change"]=True
         project=request("PATCH",prefix,json={"expected_revision":project["revision"],"rules":{"max_seconds":30}})
         wait(request("POST",prefix+"/generate",json={"expected_revision":project["revision"],"request_id":"positive-generate"}))
         project=request("GET",prefix);assert project["validation"]["status"]=="PASS",project["validation"]
         report["checks"]["generated_complete_PASS"]=project["coverage"]["complete"]
+        blank_steps=copy.deepcopy(project["plan"]["steps"])
+        for entry in blank_steps:
+            entry.update(reviewed=False,torque=None,torque_status="required",caution="",caution_reviewed=False)
+        project=request("PATCH",prefix,json={"expected_revision":project["revision"],"plan":{"steps":blank_steps}})
+        assert project["validation"]["status"]=="PASS"
+        blank_confirmation=request("POST",prefix+"/confirm",json={"expected_revision":project["revision"]})
+        report["blank_work_information_snapshot_id"]=blank_confirmation["id"]
+        report["checks"]["confirmation_without_torque_caution_or_review_check"]=True
+        project=request("GET",prefix);assert project["plan"]["status"]=="CONFIRMED"
         steps=copy.deepcopy(project["plan"]["steps"])
         for index,entry in enumerate(steps):
             entry.update(reviewed=True,duration_s=.5,name=f"시험 조립 {index+1}",torque={"value":5,"unit":"N·m"},torque_status="required",caution="시험용 주의사항입니다. 작업 대상과 진입 방향을 확인해 주세요.")

@@ -1,0 +1,298 @@
+{
+  "app_version": "2.4.0",
+  "spec_version": "0.11",
+  "build_id": "pilot-2.4.0-20261016T000015Z",
+  "tests": {
+    "python_suite": {
+      "passed": 199,
+      "seconds": 93.286
+    },
+    "path_impact_cases": 6,
+    "file_ipc_and_repair_cases": 6,
+    "typescript_build": "PASS"
+  },
+  "native_ui": {
+    "status": "PASS",
+    "checks": [
+      "Native STEP → reverse generation → full revalidation → confirmation → MP4 → manual edit/revalidation",
+      "Actual UI confirms validated sequence with empty torque/caution, unchecked work review and no recorder",
+      "Unit allowed/preferred directions saved through actual UI and invalidated proof",
+      "Design2 layout / 1440, 980, 600 px without page horizontal overflow",
+      "Generation and full revalidation show 30 minutes each; candidate/native limits show 120 seconds",
+      "Incomplete removal preserves existing steps, work information and validation",
+      "Incomplete trace stored and downloaded with exact SHA/count",
+      "Failed candidate highlights moving/blocking units with a static entry arrow; no uncertified animation",
+      "Unvalidated plan cannot be confirmed"
+    ],
+    "javascript_errors": []
+  },
+  "native_39": {
+    "build_id": "pilot-2.4.0-20261016T000015Z",
+    "kind": "generate",
+    "source_request_sha256": "d72e1a401fcdf1d9c2521e0933068f41e26ea496aa66f38a5d600029b04dfdd8",
+    "source_request_unchanged": true,
+    "unit_count": 39,
+    "occurrence_count": 39,
+    "placements_and_unit_definitions_preserved": true,
+    "before_invalid": [],
+    "after_invalid": [],
+    "after_exact_disagreements": [],
+    "analysis_ready": null,
+    "analysis_policy_version": null,
+    "analysis_refresh": null,
+    "matching_ready": true,
+    "generation_status": "PASS",
+    "validation_status": "PASS",
+    "steps": 38,
+    "search": {
+      "attempts": 6010,
+      "expanded_states": 144,
+      "cache_hits": 5121,
+      "beam_width": 4,
+      "termination": "completed",
+      "optimality": "not_globally_proven",
+      "preference_misses": 0,
+      "cost": 2122.399999999999,
+      "direction_change_cost": 10,
+      "extraction_margin_mm": 5,
+      "elapsed_seconds": 61.468
+    },
+    "diagnostics": [],
+    "playback": {
+      "policy": "verified_prefix_only",
+      "executable_prefix_count": 38,
+      "total_count": 38,
+      "blocked_count": 0,
+      "unplanned_count": 0
+    },
+    "wall_seconds": 75.468
+  },
+  "native_company_geometry": {
+    "build_id": "pilot-2.4.0-20261016T000015Z",
+    "kind": "validate",
+    "source_request_sha256": "aa29b653a25fb8b67bebc1a78eb6d8cc033d8d2f6f1978ad2d73aab4cbf950d5",
+    "source_request_unchanged": true,
+    "unit_count": 56,
+    "occurrence_count": 78,
+    "placements_and_unit_definitions_preserved": true,
+    "before_invalid": [
+      "cad_3dc9e44335fa41f9b0",
+      "cad_618fdeaa5a4061decc"
+    ],
+    "after_invalid": [],
+    "after_exact_disagreements": [],
+    "analysis_ready": true,
+    "analysis_policy_version": "analysis-geometry-2.4.0",
+    "analysis_refresh": {
+      "attempted_occurrence_ids": [
+        "cad_3dc9e44335fa41f9b0",
+        "cad_618fdeaa5a4061decc"
+      ],
+      "pending_occurrence_ids": [],
+      "elapsed_seconds": 34.98400000001129,
+      "changed": true,
+      "budget_exhausted": false,
+      "policy_version": "analysis-geometry-2.4.0"
+    },
+    "matching_ready": false,
+    "generation_status": "NOT_REQUESTED",
+    "validation_status": "BLOCKED",
+    "steps": 0,
+    "search": null,
+    "diagnostics": null,
+    "playback": null,
+    "wall_seconds": 35.813
+  },
+  "native_company_geometry_proof": {
+    "exact_ready": 78,
+    "source_hash_failures": [],
+    "scene_preserved": true
+  },
+  "company_whole_sequence_exploratory": {
+    "build_id": "pilot-2.4.0-20261015T233415Z",
+    "source_request_sha256": "aa29b653a25fb8b67bebc1a78eb6d8cc033d8d2f6f1978ad2d73aab4cbf950d5",
+    "source_request_unchanged": true,
+    "unit_count": 56,
+    "occurrence_count": 78,
+    "placements_and_unit_definitions_preserved": true,
+    "before_invalid": [
+      "cad_3dc9e44335fa41f9b0",
+      "cad_618fdeaa5a4061decc"
+    ],
+    "after_invalid": [],
+    "analysis_policy_version": "analysis-geometry-2.4.0",
+    "analysis_refresh": {
+      "attempted_occurrence_ids": [
+        "cad_3dc9e44335fa41f9b0",
+        "cad_618fdeaa5a4061decc"
+      ],
+      "pending_occurrence_ids": [],
+      "elapsed_seconds": 20.031000000002678,
+      "changed": true,
+      "budget_exhausted": false,
+      "policy_version": "analysis-geometry-2.4.0"
+    },
+    "matching_ready": false,
+    "generation_status": "UNKNOWN",
+    "validation_status": "UNKNOWN",
+    "steps": 0,
+    "search": {
+      "attempts": 55,
+      "expanded_states": 1,
+      "cache_hits": 0,
+      "beam_width": 4,
+      "termination": "geometry_unresolved",
+      "optimality": "not_globally_proven",
+      "preference_misses": 0,
+      "cost": 0.0,
+      "direction_change_cost": 10,
+      "extraction_margin_mm": 5,
+      "elapsed_seconds": 1516.891
+    },
+    "diagnostics": [
+      {
+        "code": "MODEL_MAPPING_REVIEW_REQUIRED"
+      },
+      {
+        "code": "DISASSEMBLY_INCOMPLETE",
+        "termination": "geometry_unresolved",
+        "removed": 0,
+        "total": 55
+      }
+    ],
+    "playback": null,
+    "wall_seconds": 1537.391,
+    "scope": "Source experiment on the same geometry policy; began before final transport patch. Not a final frozen-package whole-product success.",
+    "support": {
+      "attempt_reasons": {
+        "SUPPORT_GEOMETRY_UNRESOLVED": 55
+      },
+      "unsupported_parts": {
+        "SEL-KD000": 55
+      },
+      "relation_statuses": {
+        "PASS": 68,
+        "UNKNOWN": 5
+      },
+      "unresolved_relations": [
+        {
+          "parts": [
+            "PLT-KD000",
+            "HVSC 2800"
+          ],
+          "reasons": [
+            "NATIVE_TIMEOUT"
+          ]
+        },
+        {
+          "parts": [
+            "LV CONT",
+            "HVSC 2800"
+          ],
+          "reasons": [
+            "NATIVE_TIMEOUT",
+            null
+          ]
+        },
+        {
+          "parts": [
+            "PLT-KD000",
+            "HVSC 2800"
+          ],
+          "reasons": [
+            "NATIVE_TIMEOUT"
+          ]
+        },
+        {
+          "parts": [
+            "HVSC 2800",
+            "SEL-KD000"
+          ],
+          "reasons": [
+            "NATIVE_TIMEOUT"
+          ]
+        },
+        {
+          "parts": [
+            "HVSC 2800",
+            "SEL-KD000"
+          ],
+          "reasons": [
+            "NATIVE_TIMEOUT"
+          ]
+        }
+      ]
+    }
+  },
+  "matching_exploratory": {
+    "fully_frozen_build_test": false,
+    "geometry_core_unchanged": true,
+    "original_input_file_count": 161,
+    "all_original_inputs_unchanged": true,
+    "analysis_exact_pass_count": 78,
+    "rechecked_template_file_count": 5,
+    "rechecked_template_member_count": 18,
+    "rechecked_template_exact_pass_count": 18,
+    "selected_unit_statuses": {
+      "REVIEW": 6
+    },
+    "all_unit_statuses": {
+      "PASS": 50,
+      "REVIEW": 6
+    },
+    "selected_member_statuses": {
+      "REVIEW": 6,
+      "PASS": 13
+    }
+  },
+  "native_update": {
+    "status": "passed",
+    "previous_build_id": "pilot-2.3.0-20261015T101603Z",
+    "new_build_id": "pilot-2.4.0-20261016T000015Z",
+    "old_pointer": {
+      "app_version": "2.3.0",
+      "build_id": "pilot-2.3.0-20261015T101603Z",
+      "format": "pilot-active-release/2",
+      "release_id": "pilot-2.3.0-20261015T101603Z"
+    },
+    "new_pointer": {
+      "app_version": "2.4.0",
+      "build_id": "pilot-2.4.0-20261016T000015Z",
+      "format": "pilot-active-release/2",
+      "release_id": "pilot-2.4.0-20261016T000015Z"
+    },
+    "preserved_project_id": "project-a358a31faf5f48a5bdcf587fb9395ca8",
+    "preserved_row_version": 2,
+    "previous_backup_id": "backup-9021c80a614742b58ab4dee47f3ec436",
+    "backup_count": 2,
+    "failed_update_preserved_active_release": true,
+    "failed_update_preserved_data": true,
+    "old_model_requires_reprocessing": false,
+    "managed_original_reprocessed_by_new_version": true,
+    "previous_model_archived": true,
+    "scope": "native launcher/backend activation; isolated directory, no installer registration changes"
+  },
+  "installed_update": {
+    "status": "PASS",
+    "build_id": "pilot-2.4.0-20261016T000015Z",
+    "previous_build_id": "pilot-2.3.0-20261015T101603Z",
+    "installer_exit_code": 0,
+    "active_release_matches": true,
+    "desktop_backend_same_build": true,
+    "sealed_files_verified": 4074,
+    "existing_project_count": 3,
+    "existing_projects_visible": true,
+    "backup_id": "backup-0262735615924342914dc7c1a1686783",
+    "backup_crc_pass": true,
+    "backup_bytes": 133222274
+  },
+  "installer": {
+    "name": "PILOT-Studio-2.4.0-Setup.exe",
+    "bytes": 742087344,
+    "sha256": "64c68deb60de92c88b5b341a549c8ac91278f7a8b021373db88c8fc92abf0acf"
+  },
+  "limitations": [
+    "Company product complete sequence remains unresolved: sealing support and matching comparisons are incomplete.",
+    "No new-PC or field acceptance performed."
+  ]
+}
